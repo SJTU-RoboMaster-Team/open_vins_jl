@@ -79,6 +79,28 @@ Visualization Manager:
       Unreliable: false
       Value: true
     - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera Raw
+      Normalize Range: true
+      Queue Size: 10
+      Topic: /camera/image_raw
+      Unreliable: false
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera1 Raw
+      Normalize Range: true
+      Queue Size: 10
+      Topic: /camera1/image_raw
+      Unreliable: false
+      Value: true
+    - Class: rviz_default_plugins/Image
       Enabled: false
       Max Value: 1
       Median window: 5

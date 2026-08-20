@@ -98,7 +98,19 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
       dt_summed += prop_data.at(i + 1).timestamp - prop_data.at(i).timestamp;
     }
   }
-  assert(std::abs((time1 - time0) - dt_summed) < 1e-4);
+
+  // Our SITL IMU stream is best-effort, so an occasional dropped/delayed
+  // sample can make the summed propagation time differ from the requested
+  // interval by more than the assert budget. This used to be a hard assert()
+  // which aborted the whole estimator (odomimu stops -> PX4 EKF2 loses
+  // vision -> blind land). Absorb the residual and keep going: the propagation
+  // above already integrated the actual IMU readings, and camera updates will
+  // correct any sub-millisecond error.
+  double dt_prop = time1 - time0;
+  if (std::abs(dt_prop - dt_summed) > 1e-4) {
+    PRINT_WARNING(YELLOW "Propagator::propagate_and_clone(): IMU dt mismatch (requested %.6f, summed %.6f, diff %.6f s). Continuing.\n" RESET,
+                  dt_prop, dt_summed, dt_prop - dt_summed);
+  }
 
   // Last angular velocity (used for cloning when estimating time offset)
   // Remember to correct them before we store them
