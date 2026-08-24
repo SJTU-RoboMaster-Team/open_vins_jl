@@ -99,17 +99,25 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
     }
   }
 
-  // Our SITL IMU stream is best-effort, so an occasional dropped/delayed
-  // sample can make the summed propagation time differ from the requested
-  // interval by more than the assert budget. This used to be a hard assert()
-  // which aborted the whole estimator (odomimu stops -> PX4 EKF2 loses
-  // vision -> blind land). Absorb the residual and keep going: the propagation
-  // above already integrated the actual IMU readings, and camera updates will
-  // correct any sub-millisecond error.
+  // The propagation interval must equal the summed intervals of the IMU
+  // readings we actually integrated. The original implementation asserted this
+  // with an extremely tight (0.1 ms) budget, which aborted the whole estimator
+  // (odomimu stops -> PX4 EKF2 loses vision -> blind land) on any SITL IMU gap.
+  // IMU delivery is now reliable (bridge + OpenVINS both use reliable QoS), so
+  // gaps should be the exception. Keep a hard invariant with a per-sample-jitter
+  // budget and a clear severity ladder instead of either a fragile abort or a
+  // silent continue that could accumulate unnoticed time-skew.
   double dt_prop = time1 - time0;
-  if (std::abs(dt_prop - dt_summed) > 1e-4) {
-    PRINT_WARNING(YELLOW "Propagator::propagate_and_clone(): IMU dt mismatch (requested %.6f, summed %.6f, diff %.6f s). Continuing.\n" RESET,
+  const double imu_period = 1.0 / 250.0; // SITL IMU onboard rate
+  double dt_mismatch = std::abs(dt_prop - dt_summed);
+  if (dt_mismatch > 1e-4) {
+    if (dt_mismatch > 20.0 * imu_period) {
+      PRINT_ERROR(RED "Propagator::propagate_and_clone(): IMU dt mismatch too large (requested %.6f, summed %.6f, diff %.6f s). Continuing at risk.\n" RESET,
                   dt_prop, dt_summed, dt_prop - dt_summed);
+    } else {
+      PRINT_WARNING(YELLOW "Propagator::propagate_and_clone(): IMU dt mismatch (requested %.6f, summed %.6f, diff %.6f s). Using available IMU.\n" RESET,
+                    dt_prop, dt_summed, dt_prop - dt_summed);
+    }
   }
 
   // Last angular velocity (used for cloning when estimating time offset)

@@ -95,10 +95,14 @@ public:
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
 
-  /// If the estimator has completed initialization. A stationary ZUPT can
-  /// legitimately return before the first full feature update, but odometry
-  /// must still be publishable so downstream fusion can start.
-  bool initialized() { return is_initialized_vio; }
+  /// If we are initialized or not (requires at least one completed update)
+  bool initialized() { return is_initialized_vio && timelastupdate != -1; }
+
+  /// True once the estimator's initialization has been accepted, even before
+  /// the first full feature update. During a stationary ground hold ZUPT can
+  /// legitimately satisfy every frame, so `initialized()` stays false while
+  /// high-rate odometry must still be publishable to downstream fusion.
+  bool initialized_estimator() const { return is_initialized_vio; }
 
   /// Timestamp that the system was initialized at
   double initialized_time() { return startup_time; }

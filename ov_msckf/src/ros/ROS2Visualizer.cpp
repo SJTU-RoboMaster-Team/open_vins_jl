@@ -40,7 +40,7 @@ constexpr std::size_t kMaxPendingCameraMeasurements = 3;
 }
 
 ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim)
-    : _node(node), _app(app), _sim(sim), thread_update_running(false) {
+    : _node(node), _app(app), _sim(sim) {
 
   // Setup our transform broadcaster
   mTfBr = std::make_shared<tf2_ros::TransformBroadcaster>(node);
@@ -162,6 +162,10 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
     });
     thread.detach();
   }
+
+  // Camera/visualization update worker. It is joined in visualize_final() and
+  // the destructor, so no detached thread can outlive this node.
+  update_thread_ = std::thread(&ROS2Visualizer::update_worker, this);
 }
 
 void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> parser) {
@@ -174,7 +178,11 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
   _node->declare_parameter<std::string>("topic_imu", "/imu0");
   _node->get_parameter("topic_imu", topic_imu);
   parser->parse_external("relative_config_imu", "imu0", "rostopic", topic_imu);
-  sub_imu = _node->create_subscription<sensor_msgs::msg::Imu>(topic_imu, rclcpp::SensorDataQoS(),
+  // Reliable IMU delivery with a deep history. The old best-effort path could
+  // silently drop 250 Hz samples under SITL/load, leaving Propagator with a
+  // truncated measurement window. The bridge publishes the matching reliable QoS.
+  const auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable();
+  sub_imu = _node->create_subscription<sensor_msgs::msg::Imu>(topic_imu, imu_qos,
                                                               std::bind(&ROS2Visualizer::callback_inertial, this, std::placeholders::_1));
   PRINT_INFO("subscribing to IMU: %s\n", topic_imu.c_str());
 
@@ -273,8 +281,11 @@ void ROS2Visualizer::visualize() {
 
 void ROS2Visualizer::visualize_odometry(double timestamp) {
 
-  // Return if we have not inited and a second has passes
-  if (!_app->initialized() || (timestamp - _app->initialized_time()) < 1)
+  // Return if the estimator has not accepted its initialize or we are within
+  // the first second after it. Use initialized_estimator() (not initialized())
+  // so odometry can flow during a stationary ZUPT ground hold, before the first
+  // full feature update has completed.
+  if (!_app->initialized_estimator() || (timestamp - _app->initialized_time()) < 1)
     return;
 
   // Get fast propagate state at the desired timestamp
@@ -352,6 +363,10 @@ void ROS2Visualizer::visualize_odometry(double timestamp) {
 }
 
 void ROS2Visualizer::visualize_final() {
+
+  // Stop the update worker before printing the final state so no worker thread
+  // can mutate the estimator concurrently with the final summary.
+  request_stop();
 
   // Final time offset value
   if (_app->get_state()->_options.do_calib_camera_timeoffset) {
@@ -449,18 +464,34 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
   _app->feed_measurement_imu(message);
   visualize_odometry(message.timestamp);
 
-  // If the processing queue is currently active / running just return so we can keep getting measurements
-  // Otherwise create a second thread to do our update in an async manor
-  // The visualization of the state, images, and features will be synchronous with the update!
-  if (thread_update_running)
-    return;
-  thread_update_running = true;
-  // The update runs detached when multi-threaded subscriptions are enabled.
-  // Capture the timestamp by value; capturing the local ImuData by reference
-  // leaves the worker with a dangling reference as soon as this callback
-  // returns.
-  const double imu_timestamp = message.timestamp;
-  std::thread thread([this, imu_timestamp] {
+  // Wake up the single background update worker with the newest IMU time. The
+  // worker processes all camera frames that are now processable and runs the
+  // visualization synchronously with the update. No detached worker is created
+  // here, so we never risk a dangling reference or a worker outliving the node.
+  {
+    std::lock_guard<std::mutex> lck(update_mtx_);
+    update_latest_imu_ts_ = message.timestamp;
+    update_pending_ = true;
+  }
+  update_cv_.notify_one();
+}
+
+void ROS2Visualizer::update_worker() {
+
+  while (true) {
+
+    // Wait for either a new IMU-triggered wake-up or a shutdown request.
+    double imu_timestamp = 0.0;
+    {
+      std::unique_lock<std::mutex> lck(update_mtx_);
+      update_cv_.wait(lck, [this] { return update_pending_ || update_stop_; });
+      if (update_stop_ && !update_pending_) {
+        return;
+      }
+      update_pending_ = false;
+      imu_timestamp = update_latest_imu_ts_;
+    }
+
     // Lock on the queue (prevents new images from appending)
     std::lock_guard<std::mutex> lck(camera_queue_mtx);
 
@@ -497,16 +528,23 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
         PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
       }
     }
-    thread_update_running = false;
-  });
-
-  // If we are single threaded, then run single threaded
-  // Otherwise detach this thread so it runs in the background!
-  if (!_app->get_params().use_multi_threading_subs) {
-    thread.join();
-  } else {
-    thread.detach();
   }
+}
+
+void ROS2Visualizer::request_stop() {
+  {
+    std::lock_guard<std::mutex> lck(update_mtx_);
+    update_stop_ = true;
+    update_pending_ = false;
+  }
+  update_cv_.notify_all();
+  if (update_thread_.joinable()) {
+    update_thread_.join();
+  }
+}
+
+ROS2Visualizer::~ROS2Visualizer() {
+  request_stop();
 }
 
 void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr msg0, int cam_id0) {

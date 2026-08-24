@@ -46,9 +46,11 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include <Eigen/Eigen>
 #include <boost/date_time/posix_time/posix_time.hpp>
@@ -109,6 +111,9 @@ public:
    */
   void visualize_final();
 
+  /// Destructor ensures the worker thread is joined before shutdown
+  ~ROS2Visualizer();
+
   /// Callback for inertial information
   void callback_inertial(const sensor_msgs::msg::Imu::SharedPtr msg);
 
@@ -134,6 +139,12 @@ protected:
 
   /// Publish loop-closure information of current pose and active track information
   void publish_loopclosure_information();
+
+  /// Background loop: waits for an IMU wake-up and processes processable camera measurements
+  void update_worker();
+
+  /// Stop and join the background update thread
+  void request_stop();
 
   /// Global node handler
   std::shared_ptr<rclcpp::Node> _node;
@@ -178,8 +189,16 @@ protected:
   bool start_time_set = false;
   boost::posix_time::ptime rT1, rT2;
 
-  // Thread atomics
-  std::atomic<bool> thread_update_running;
+  // Camera/update worker thread. A single owned thread performs the
+  // measurement-update loop (and visualization). IMU callbacks only enqueue a
+  // "wake up" notification, so no detached worker can outlive this object and
+  // no check-then-set race can spawn multiple concurrent workers.
+  std::thread update_thread_;
+  std::mutex update_mtx_;
+  std::condition_variable update_cv_;
+  bool update_pending_ = false;
+  bool update_stop_ = false;
+  double update_latest_imu_ts_ = 0.0;
 
   /// Queue up camera measurements sorted by time and trigger once we have
   /// exactly one IMU measurement with timestamp newer than the camera measurement
