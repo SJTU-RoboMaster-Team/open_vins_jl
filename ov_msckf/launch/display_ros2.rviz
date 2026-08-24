@@ -51,7 +51,7 @@ Visualization Manager:
           Value: true
         imu:
           Value: true
-        truth:
+        gazebo_world:
           Value: true
       Marker Scale: 1
       Name: TF
@@ -63,12 +63,12 @@ Visualization Manager:
           imu:
             cam0:
               {}
-          truth:
+          gazebo_world:
             {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
-      Enabled: true
+      Enabled: false
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -77,9 +77,9 @@ Visualization Manager:
       Queue Size: 10
       Topic: /ov_msckf/trackhist
       Unreliable: false
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Image
-      Enabled: true
+      Enabled: false
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -88,9 +88,9 @@ Visualization Manager:
       Queue Size: 10
       Topic: /camera/image_raw
       Unreliable: false
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Image
-      Enabled: true
+      Enabled: false
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -99,7 +99,7 @@ Visualization Manager:
       Queue Size: 10
       Topic: /camera1/image_raw
       Unreliable: false
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Image
       Enabled: false
       Max Value: 1
@@ -144,7 +144,7 @@ Visualization Manager:
       Length: 0.30000001192092896
       Line Style: Billboards
       Line Width: 0.009999999776482582
-      Name: Path GT
+      Name: Path Gazebo Truth
       Offset:
         X: 0
         Y: 0
@@ -154,8 +154,21 @@ Visualization Manager:
       Radius: 0.029999999329447746
       Shaft Diameter: 0.10000000149011612
       Shaft Length: 0.10000000149011612
-      Topic: /ov_msckf/pathgt
+      Topic: /gazebo/ground_truth/path
       Unreliable: false
+      Value: true
+    - Alpha: 1
+      Axes Length: 0.5
+      Axes Radius: 0.03
+      Class: rviz_default_plugins/Pose
+      Color: 255; 170; 0
+      Head Length: 0.2
+      Head Radius: 0.08
+      Name: Pose Gazebo Truth
+      Shaft Length: 0.3
+      Shaft Radius: 0.04
+      Shape: Arrow
+      Topic: /gazebo/ground_truth/pose
       Value: true
     - Alpha: 0.800000011920929
       Autocompute Intensity Bounds: true

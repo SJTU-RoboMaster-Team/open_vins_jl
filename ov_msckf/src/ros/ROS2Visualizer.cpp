@@ -35,6 +35,10 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+namespace {
+constexpr std::size_t kMaxPendingCameraMeasurements = 3;
+}
+
 ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim)
     : _node(node), _app(app), _sim(sim), thread_update_running(false) {
 
@@ -233,6 +237,10 @@ void ROS2Visualizer::visualize() {
   if (!_app->get_params().use_multi_threading_pubs)
     publish_images();
 
+  // Publish static camera calibration before VIO initialization so the
+  // secondary loop-fusion node can start while the estimator is warming up.
+  publish_loopclosure_information();
+
   // Return if we have not inited
   if (!_app->initialized())
     return;
@@ -251,9 +259,6 @@ void ROS2Visualizer::visualize() {
 
   // Publish gt if we have it
   publish_groundtruth();
-
-  // Publish keyframe information
-  publish_loopclosure_information();
 
   // Save total state
   if (save_total_state) {
@@ -279,50 +284,47 @@ void ROS2Visualizer::visualize_odometry(double timestamp) {
   if (!_app->get_propagator()->fast_state_propagate(state, timestamp, state_plus, cov_plus))
     return;
 
-  // Publish our odometry message if requested
-  if (pub_odomimu->get_subscription_count() != 0) {
+  // Publish odometry continuously. Subscriber-count gating can race ROS 2
+  // graph discovery and starve downstream loop fusion despite a live match.
+  nav_msgs::msg::Odometry odomIinM;
+  odomIinM.header.stamp = ROSVisualizerHelper::get_time_from_seconds(timestamp);
+  odomIinM.header.frame_id = "global";
 
-    // Our odometry message
-    nav_msgs::msg::Odometry odomIinM;
-    odomIinM.header.stamp = ROSVisualizerHelper::get_time_from_seconds(timestamp);
-    odomIinM.header.frame_id = "global";
+  // The POSE component (orientation and position)
+  odomIinM.pose.pose.orientation.x = state_plus(0);
+  odomIinM.pose.pose.orientation.y = state_plus(1);
+  odomIinM.pose.pose.orientation.z = state_plus(2);
+  odomIinM.pose.pose.orientation.w = state_plus(3);
+  odomIinM.pose.pose.position.x = state_plus(4);
+  odomIinM.pose.pose.position.y = state_plus(5);
+  odomIinM.pose.pose.position.z = state_plus(6);
 
-    // The POSE component (orientation and position)
-    odomIinM.pose.pose.orientation.x = state_plus(0);
-    odomIinM.pose.pose.orientation.y = state_plus(1);
-    odomIinM.pose.pose.orientation.z = state_plus(2);
-    odomIinM.pose.pose.orientation.w = state_plus(3);
-    odomIinM.pose.pose.position.x = state_plus(4);
-    odomIinM.pose.pose.position.y = state_plus(5);
-    odomIinM.pose.pose.position.z = state_plus(6);
+  // The TWIST component (angular and linear velocities)
+  odomIinM.child_frame_id = "imu";
+  odomIinM.twist.twist.linear.x = state_plus(7);   // vel in local frame
+  odomIinM.twist.twist.linear.y = state_plus(8);   // vel in local frame
+  odomIinM.twist.twist.linear.z = state_plus(9);   // vel in local frame
+  odomIinM.twist.twist.angular.x = state_plus(10); // we do not estimate this...
+  odomIinM.twist.twist.angular.y = state_plus(11); // we do not estimate this...
+  odomIinM.twist.twist.angular.z = state_plus(12); // we do not estimate this...
 
-    // The TWIST component (angular and linear velocities)
-    odomIinM.child_frame_id = "imu";
-    odomIinM.twist.twist.linear.x = state_plus(7);   // vel in local frame
-    odomIinM.twist.twist.linear.y = state_plus(8);   // vel in local frame
-    odomIinM.twist.twist.linear.z = state_plus(9);   // vel in local frame
-    odomIinM.twist.twist.angular.x = state_plus(10); // we do not estimate this...
-    odomIinM.twist.twist.angular.y = state_plus(11); // we do not estimate this...
-    odomIinM.twist.twist.angular.z = state_plus(12); // we do not estimate this...
-
-    // Finally set the covariance in the message (in the order position then orientation as per ros convention)
-    Eigen::Matrix<double, 12, 12> Phi = Eigen::Matrix<double, 12, 12>::Zero();
-    Phi.block(0, 3, 3, 3).setIdentity();
-    Phi.block(3, 0, 3, 3).setIdentity();
-    Phi.block(6, 6, 6, 6).setIdentity();
-    cov_plus = Phi * cov_plus * Phi.transpose();
-    for (int r = 0; r < 6; r++) {
-      for (int c = 0; c < 6; c++) {
-        odomIinM.pose.covariance[6 * r + c] = cov_plus(r, c);
-      }
+  // Finally set the covariance in the message (in the order position then orientation as per ros convention)
+  Eigen::Matrix<double, 12, 12> Phi = Eigen::Matrix<double, 12, 12>::Zero();
+  Phi.block(0, 3, 3, 3).setIdentity();
+  Phi.block(3, 0, 3, 3).setIdentity();
+  Phi.block(6, 6, 6, 6).setIdentity();
+  cov_plus = Phi * cov_plus * Phi.transpose();
+  for (int r = 0; r < 6; r++) {
+    for (int c = 0; c < 6; c++) {
+      odomIinM.pose.covariance[6 * r + c] = cov_plus(r, c);
     }
-    for (int r = 0; r < 6; r++) {
-      for (int c = 0; c < 6; c++) {
-        odomIinM.twist.covariance[6 * r + c] = cov_plus(r + 6, c + 6);
-      }
-    }
-    pub_odomimu->publish(odomIinM);
   }
+  for (int r = 0; r < 6; r++) {
+    for (int c = 0; c < 6; c++) {
+      odomIinM.twist.covariance[6 * r + c] = cov_plus(r + 6, c + 6);
+    }
+  }
+  pub_odomimu->publish(odomIinM);
 
   // Publish our transform on TF
   // NOTE: since we use JPL we have an implicit conversion to Hamilton when we publish
@@ -453,7 +455,12 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
   if (thread_update_running)
     return;
   thread_update_running = true;
-  std::thread thread([&] {
+  // The update runs detached when multi-threaded subscriptions are enabled.
+  // Capture the timestamp by value; capturing the local ImuData by reference
+  // leaves the worker with a dangling reference as soon as this callback
+  // returns.
+  const double imu_timestamp = message.timestamp;
+  std::thread thread([this, imu_timestamp] {
     // Lock on the queue (prevents new images from appending)
     std::lock_guard<std::mutex> lck(camera_queue_mtx);
 
@@ -471,7 +478,14 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
 
       // Loop through our queue and see if we are able to process any of our camera measurements
       // We are able to process if we have at least one IMU measurement greater than the camera time
-      double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+      double timestamp_imu_inC = imu_timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+      // If processing falls behind the sensor stream, old frames are no
+      // longer useful to the tracker. Keep the newest processable frame so
+      // visual updates stay close to the current IMU time instead of growing
+      // an unbounded latency that can destabilize the estimator.
+      while (camera_queue.size() > 1 && camera_queue.at(1).timestamp < timestamp_imu_inC) {
+        camera_queue.pop_front();
+      }
       while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
         auto rT0_1 = boost::posix_time::microsec_clock::local_time();
         double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
@@ -532,6 +546,9 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
   std::lock_guard<std::mutex> lck(camera_queue_mtx);
   camera_queue.push_back(message);
   std::sort(camera_queue.begin(), camera_queue.end());
+  while (camera_queue.size() > kMaxPendingCameraMeasurements) {
+    camera_queue.pop_front();
+  }
 }
 
 void ROS2Visualizer::callback_stereo(const sensor_msgs::msg::Image::ConstSharedPtr msg0, const sensor_msgs::msg::Image::ConstSharedPtr msg1,
@@ -586,6 +603,9 @@ void ROS2Visualizer::callback_stereo(const sensor_msgs::msg::Image::ConstSharedP
   std::lock_guard<std::mutex> lck(camera_queue_mtx);
   camera_queue.push_back(message);
   std::sort(camera_queue.begin(), camera_queue.end());
+  while (camera_queue.size() > kMaxPendingCameraMeasurements) {
+    camera_queue.pop_front();
+  }
 }
 
 void ROS2Visualizer::publish_state() {
@@ -832,6 +852,41 @@ void ROS2Visualizer::publish_groundtruth() {
 
 void ROS2Visualizer::publish_loopclosure_information() {
 
+  // Camera calibration is valid as soon as the estimator is initialized. It
+  // must not wait for a matching active image/clone, otherwise loop_fusion
+  // cannot initialize and no corrected odometry is produced.
+  if (!_app->get_state()->_calib_IMUtoCAM.empty() &&
+      !_app->get_state()->_cam_intrinsics.empty()) {
+    std_msgs::msg::Header calibration_header;
+    calibration_header.stamp = _node->now();
+
+    Eigen::Vector4d q_ItoC = _app->get_state()->_calib_IMUtoCAM.at(0)->quat();
+    Eigen::Vector3d p_CinI = -_app->get_state()->_calib_IMUtoCAM.at(0)->Rot().transpose() *
+      _app->get_state()->_calib_IMUtoCAM.at(0)->pos();
+    nav_msgs::msg::Odometry odometry_calib;
+    odometry_calib.header = calibration_header;
+    odometry_calib.header.frame_id = "imu";
+    odometry_calib.pose.pose.position.x = p_CinI(0);
+    odometry_calib.pose.pose.position.y = p_CinI(1);
+    odometry_calib.pose.pose.position.z = p_CinI(2);
+    odometry_calib.pose.pose.orientation.x = q_ItoC(0);
+    odometry_calib.pose.pose.orientation.y = q_ItoC(1);
+    odometry_calib.pose.pose.orientation.z = q_ItoC(2);
+    odometry_calib.pose.pose.orientation.w = q_ItoC(3);
+    pub_loop_extrinsic->publish(odometry_calib);
+
+    bool is_fisheye = (std::dynamic_pointer_cast<ov_core::CamEqui>(
+        _app->get_params().camera_intrinsics.at(0)) != nullptr);
+    sensor_msgs::msg::CameraInfo cameraparams;
+    cameraparams.header = calibration_header;
+    cameraparams.header.frame_id = "cam0";
+    cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
+    Eigen::VectorXd cparams = _app->get_state()->_cam_intrinsics.at(0)->value();
+    cameraparams.d = {cparams(4), cparams(5), cparams(6), cparams(7)};
+    cameraparams.k = {cparams(0), 0, cparams(2), 0, cparams(1), cparams(3), 0, 0, 1};
+    pub_loop_intrinsics->publish(cameraparams);
+  }
+
   // Get the current tracks in this frame
   double active_tracks_time1 = -1;
   double active_tracks_time2 = -1;
@@ -852,9 +907,8 @@ void ROS2Visualizer::publish_loopclosure_information() {
   header.stamp = ROSVisualizerHelper::get_time_from_seconds(active_tracks_time1);
 
   //======================================================
-  // Check if we have subscribers for the pose odometry, camera intrinsics, or extrinsics
-  if (pub_loop_pose->get_subscription_count() != 0 || pub_loop_extrinsic->get_subscription_count() != 0 ||
-      pub_loop_intrinsics->get_subscription_count() != 0) {
+  // Publish a historical pose only when the active clone is available.
+  if (pub_loop_pose->get_subscription_count() != 0) {
 
     // PUBLISH HISTORICAL POSE ESTIMATE
     nav_msgs::msg::Odometry odometry_pose;
@@ -869,32 +923,6 @@ void ROS2Visualizer::publish_loopclosure_information() {
     odometry_pose.pose.pose.orientation.w = _app->get_state()->_clones_IMU.at(active_tracks_time1)->quat()(3);
     pub_loop_pose->publish(odometry_pose);
 
-    // PUBLISH IMU TO CAMERA0 EXTRINSIC
-    // need to flip the transform to the IMU frame
-    Eigen::Vector4d q_ItoC = _app->get_state()->_calib_IMUtoCAM.at(0)->quat();
-    Eigen::Vector3d p_CinI = -_app->get_state()->_calib_IMUtoCAM.at(0)->Rot().transpose() * _app->get_state()->_calib_IMUtoCAM.at(0)->pos();
-    nav_msgs::msg::Odometry odometry_calib;
-    odometry_calib.header = header;
-    odometry_calib.header.frame_id = "imu";
-    odometry_calib.pose.pose.position.x = p_CinI(0);
-    odometry_calib.pose.pose.position.y = p_CinI(1);
-    odometry_calib.pose.pose.position.z = p_CinI(2);
-    odometry_calib.pose.pose.orientation.x = q_ItoC(0);
-    odometry_calib.pose.pose.orientation.y = q_ItoC(1);
-    odometry_calib.pose.pose.orientation.z = q_ItoC(2);
-    odometry_calib.pose.pose.orientation.w = q_ItoC(3);
-    pub_loop_extrinsic->publish(odometry_calib);
-
-    // PUBLISH CAMERA0 INTRINSICS
-    bool is_fisheye = (std::dynamic_pointer_cast<ov_core::CamEqui>(_app->get_params().camera_intrinsics.at(0)) != nullptr);
-    sensor_msgs::msg::CameraInfo cameraparams;
-    cameraparams.header = header;
-    cameraparams.header.frame_id = "cam0";
-    cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
-    Eigen::VectorXd cparams = _app->get_state()->_cam_intrinsics.at(0)->value();
-    cameraparams.d = {cparams(4), cparams(5), cparams(6), cparams(7)};
-    cameraparams.k = {cparams(0), 0, cparams(2), 0, cparams(1), cparams(3), 0, 0, 1};
-    pub_loop_intrinsics->publish(cameraparams);
   }
 
   //======================================================
