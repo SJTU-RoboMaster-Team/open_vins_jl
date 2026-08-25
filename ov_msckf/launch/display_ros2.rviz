@@ -68,7 +68,7 @@ Visualization Manager:
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
-      Enabled: false
+      Enabled: true
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -77,7 +77,7 @@ Visualization Manager:
       Queue Size: 10
       Topic: /ov_msckf/trackhist
       Unreliable: false
-      Value: false
+      Value: true
     - Class: rviz_default_plugins/Image
       Enabled: false
       Max Value: 1

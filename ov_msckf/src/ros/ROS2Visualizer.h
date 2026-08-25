@@ -46,7 +46,9 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -146,6 +148,9 @@ protected:
   /// Stop and join the background update thread
   void request_stop();
 
+  /// Record one completed camera update for the on-image processing-rate overlay
+  void record_processed_camera_frame();
+
   /// Global node handler
   std::shared_ptr<rclcpp::Node> _node;
 
@@ -207,12 +212,29 @@ protected:
   std::deque<ov_core::CameraData> camera_queue;
   std::mutex camera_queue_mtx;
 
+  // Rolling wall-clock rate of completed OpenVINS camera updates. This is
+  // separate from the ROS/Gazebo timestamps, which may pause or drift under
+  // simulation load.
+  std::mutex processing_fps_mtx_;
+  std::deque<std::chrono::steady_clock::time_point> processed_camera_frames_;
+  double processing_fps_ = 0.0;
+
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;
 
   // Last timestamp we visualized at
   double last_visualization_timestamp = 0;
   double last_visualization_timestamp_image = 0;
+  double last_odom_publish_time = 0.0;
+  double last_tf_publish_time = 0.0;
+  double last_points_publish_time = 0.0;
+  double last_track_image_publish_time = 0.0;
+  double last_loopclosure_publish_time = 0.0;
+  double last_path_imu_sample_time = 0.0;
+  double last_path_imu_publish_time = 0.0;
+  double last_path_gt_sample_time = 0.0;
+  double last_path_gt_publish_time = 0.0;
+  double last_time_log_time = 0.0;
 
   // Our groundtruth states
   std::map<double, Eigen::Matrix<double, 17, 1>> gt_states;
