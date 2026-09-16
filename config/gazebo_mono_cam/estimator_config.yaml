@@ -34,8 +34,8 @@ zupt_max_disparity: 0.5
 zupt_only_at_beginning: true
 init_window_time: 2.0
 init_imu_thresh: 1.0
-# Static initialization requires a positive maximum image disparity while the
-# vehicle is stationary on the ground.
+# Use the visual motion gate during initialization; FeatureHelper handles the
+# simulator timestamp boundary inclusively for both initialization windows.
 init_max_disparity: 0.5
 init_max_features: 100
 # The flight controller waits for a stationary, initialized VIO before

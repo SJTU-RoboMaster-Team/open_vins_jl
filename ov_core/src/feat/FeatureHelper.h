@@ -91,6 +91,7 @@ public:
       disp_mean = -1;
       disp_var = -1;
       total_feats = 0;
+      return;
     }
 
     // Compute mean and standard deviation in respect to it
@@ -132,28 +133,32 @@ public:
         if (campairs.second.size() < 2)
           continue;
 
-        // Now lets calculate the disparity (assumes time array is monotonic)
+        // Calculate the disparity using the first and last observations in
+        // the requested time window. The previous implementation selected the
+        // first timestamp after oldest_time and then required a later timestamp
+        // to be strictly less than newest_time. That dropped a feature when
+        // its newest observation landed exactly on the window boundary, which
+        // is common with simulator timestamps.
         size_t camid = campairs.first;
         bool found0 = false;
-        bool found1 = false;
+        size_t num_in_window = 0;
         Eigen::Vector2f uv0 = Eigen::Vector2f::Zero();
         Eigen::Vector2f uv1 = Eigen::Vector2f::Zero();
         for (size_t idx = 0; idx < feat.second->timestamps.at(camid).size(); idx++) {
           double time = feat.second->timestamps.at(camid).at(idx);
-          if ((oldest_time == -1 || time > oldest_time) && !found0) {
-            uv0 = feat.second->uvs.at(camid).at(idx).block(0, 0, 2, 1);
+          if ((oldest_time != -1 && time <= oldest_time) || (newest_time != -1 && time > newest_time))
+            continue;
+          Eigen::Vector2f uv = feat.second->uvs.at(camid).at(idx).block(0, 0, 2, 1);
+          if (!found0) {
+            uv0 = uv;
             found0 = true;
-            continue;
           }
-          if ((newest_time == -1 || time < newest_time) && found0) {
-            uv1 = feat.second->uvs.at(camid).at(idx).block(0, 0, 2, 1);
-            found1 = true;
-            continue;
-          }
+          uv1 = uv;
+          num_in_window++;
         }
 
         // If we found both an old and a new time, then we are good!
-        if (!found0 || !found1)
+        if (!found0 || num_in_window < 2)
           continue;
         disparities.push_back((uv1 - uv0).norm());
       }
@@ -164,6 +169,7 @@ public:
       disp_mean = -1;
       disp_var = -1;
       total_feats = 0;
+      return;
     }
 
     // Compute mean and standard deviation in respect to it

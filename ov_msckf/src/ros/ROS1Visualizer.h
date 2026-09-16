@@ -39,17 +39,24 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <std_msgs/Float64.h>
+#include <std_msgs/Int32.h>
 #include <tf/transform_broadcaster.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include <Eigen/Eigen>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/filesystem.hpp>
 #include <cv_bridge/cv_bridge.h>
+
+#include "utils/ImuPreFilter.h"
 
 namespace ov_core {
 class YamlParser;
@@ -105,6 +112,9 @@ public:
    */
   void visualize_final();
 
+  /// Destructor ensures worker threads are stopped before shutdown
+  ~ROS1Visualizer();
+
   /// Callback for inertial information
   void callback_inertial(const sensor_msgs::Imu::ConstPtr &msg);
 
@@ -130,6 +140,12 @@ protected:
   /// Publish loop-closure information of current pose and active track information
   void publish_loopclosure_information();
 
+  /// Background loop: waits for an IMU wake-up and processes processable camera measurements
+  void update_worker();
+
+  /// Stop and join all background threads
+  void request_stop();
+
   /// Global node handler
   std::shared_ptr<ros::NodeHandle> _nh;
 
@@ -143,6 +159,8 @@ protected:
   image_transport::Publisher it_pub_tracks, it_pub_loop_img_depth, it_pub_loop_img_depth_color;
   ros::Publisher pub_poseimu, pub_odomimu, pub_pathimu;
   ros::Publisher pub_points_msckf, pub_points_slam, pub_points_aruco, pub_points_sim;
+  /// Live VIO-health observable: #features contributing to the estimate (msckf-good + slam)
+  ros::Publisher pub_feat;
   ros::Publisher pub_loop_pose, pub_loop_point, pub_loop_extrinsic, pub_loop_intrinsics;
   std::shared_ptr<tf::TransformBroadcaster> mTfBr;
 
@@ -169,8 +187,24 @@ protected:
   bool start_time_set = false;
   boost::posix_time::ptime rT1, rT2;
 
-  // Thread atomics
-  std::atomic<bool> thread_update_running;
+  // Camera/update worker thread. IMU callbacks only enqueue a wake-up
+  // notification, so no callback-local data is accessed asynchronously.
+  std::thread update_thread_;
+  std::mutex update_mtx_;
+  std::condition_variable update_cv_;
+  bool update_pending_ = false;
+  bool update_stop_ = false;
+  double update_latest_imu_ts_ = 0.0;
+
+  // Image publication has its own owned thread when enabled.
+  std::thread image_publish_thread_;
+  std::atomic<bool> image_publish_stop_{false};
+
+  // T265 vibration pre-filter (gyro LPF + accel median) applied in
+  // callback_inertial. Only touched from the ctor and the (ROS1-serialized)
+  // single IMU subscription callback, so it needs no lock.
+  ov_core::ImuPreFilter imu_pre_filter_;
+  bool imu_pre_filter_enable_ = true;
 
   /// Queue up camera measurements sorted by time and trigger once we have
   /// exactly one IMU measurement with timestamp newer than the camera measurement

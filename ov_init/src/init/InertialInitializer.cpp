@@ -117,17 +117,19 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
     FeatureHelper::compute_disparity(_db, avg_disp0, var_disp0, num_features0, newest_time_allowed);
     FeatureHelper::compute_disparity(_db, avg_disp1, var_disp1, num_features1, newest_cam_time, newest_time_allowed);
 
-    // Return if we can't compute the disparity
+    // The visual motion gate is optional when a valid pair of windows cannot
+    // be formed. With ZUPT-enabled startup, the static initializer below still
+    // validates the two IMU windows and is the authoritative ground-hold check.
     int feat_thresh = 15;
     if (num_features0 < feat_thresh || num_features1 < feat_thresh) {
-      PRINT_WARNING(YELLOW "[init]: not enough feats to compute disp: %d,%d < %d\n" RESET, num_features0, num_features1, feat_thresh);
-      return false;
+      PRINT_WARNING(YELLOW "[init]: not enough feats to compute disp: %d,%d < %d; using IMU static check\n" RESET, num_features0,
+                    num_features1, feat_thresh);
+    } else {
+      // Check if it passed our check!
+      PRINT_INFO(YELLOW "[init]: disparity is %.3f,%.3f (%.2f thresh)\n" RESET, avg_disp0, avg_disp1, params.init_max_disparity);
+      disparity_detected_moving_1to0 = (avg_disp0 > params.init_max_disparity);
+      disparity_detected_moving_2to1 = (avg_disp1 > params.init_max_disparity);
     }
-
-    // Check if it passed our check!
-    PRINT_INFO(YELLOW "[init]: disparity is %.3f,%.3f (%.2f thresh)\n" RESET, avg_disp0, avg_disp1, params.init_max_disparity);
-    disparity_detected_moving_1to0 = (avg_disp0 > params.init_max_disparity);
-    disparity_detected_moving_2to1 = (avg_disp1 > params.init_max_disparity);
   }
 
   // Use our static initializer!

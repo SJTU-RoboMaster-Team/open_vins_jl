@@ -35,8 +35,12 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+namespace {
+constexpr std::size_t kMaxPendingCameraMeasurements = 3;
+}
+
 ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim)
-    : _nh(nh), _app(app), _sim(sim), thread_update_running(false) {
+    : _nh(nh), _app(app), _sim(sim) {
 
   // Setup our transform broadcaster
   mTfBr = std::make_shared<tf::TransformBroadcaster>();
@@ -62,6 +66,10 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   pub_points_sim = nh->advertise<sensor_msgs::PointCloud2>("points_sim", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_sim.getTopic().c_str());
 
+  // Feature-count health topic (resolves under the node ns, e.g. /ov_msckf/tracked_features)
+  pub_feat = nh->advertise<std_msgs::Int32>("tracked_features", 1);
+  PRINT_DEBUG("Publishing: %s\n", pub_feat.getTopic().c_str());
+
   // Our tracking image
   it_pub_tracks = it.advertise("trackhist", 2);
   PRINT_DEBUG("Publishing: %s\n", it_pub_tracks.getTopic().c_str());
@@ -83,6 +91,27 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   // option to enable publishing of global to IMU transformation
   nh->param<bool>("publish_global_to_imu_tf", publish_global2imu_tf, true);
   nh->param<bool>("publish_calibration_tf", publish_calibration_tf, true);
+
+  // T265 vibration pre-filter (see ov_core/utils/ImuPreFilter.h). The T265
+  // united IMU stream is a fixed 199.94 Hz (firmware-interpolated); OpenVINS
+  // never parses the kalibr "update_rate" field, so this fs is a constant.
+  static constexpr double kImuPreFilterFsHz = 199.94;
+  nh->param<bool>("imu_pre_filter_enable", imu_pre_filter_enable_, true);
+  bool imu_gyro_lp_enable = true;
+  double imu_gyro_lp_fc_hz = 30.0;
+  int imu_acc_median_window = 3;
+  nh->param<bool>("imu_gyro_lp_enable", imu_gyro_lp_enable, true);
+  nh->param<double>("imu_gyro_lp_fc_hz", imu_gyro_lp_fc_hz, 30.0);
+  nh->param<int>("imu_acc_median_window", imu_acc_median_window, 3);
+  try {
+    imu_pre_filter_.configure(imu_gyro_lp_enable, kImuPreFilterFsHz, imu_gyro_lp_fc_hz, imu_acc_median_window);
+  } catch (const std::exception &e) {
+    imu_pre_filter_enable_ = false;
+    PRINT_ERROR(RED "IMU pre-filter DISABLED due to bad config: %s\n" RESET, e.what());
+  }
+  PRINT_INFO(REDPURPLE "IMU pre-filter: enable=%d gyro_lp=%d fc=%.1fHz acc_median=%d\n" RESET,
+             static_cast<int>(imu_pre_filter_enable_), static_cast<int>(imu_gyro_lp_enable), imu_gyro_lp_fc_hz,
+             imu_acc_median_window);
 
   // Load groundtruth if we have it and are not doing simulation
   // NOTE: needs to be a csv ASL format file
@@ -137,15 +166,18 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
 
   // Start thread for the image publishing
   if (_app->get_params().use_multi_threading_pubs) {
-    std::thread thread([&] {
+    image_publish_thread_ = std::thread([this] {
       ros::Rate loop_rate(20);
-      while (ros::ok()) {
+      while (ros::ok() && !image_publish_stop_.load()) {
         publish_images();
         loop_rate.sleep();
       }
     });
-    thread.detach();
   }
+
+  // Camera/visualization update worker. It is joined before the final state is
+  // printed and again safely from the destructor if needed.
+  update_thread_ = std::thread(&ROS1Visualizer::update_worker, this);
 }
 
 void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> parser) {
@@ -244,8 +276,11 @@ void ROS1Visualizer::visualize() {
 
 void ROS1Visualizer::visualize_odometry(double timestamp) {
 
-  // Return if we have not inited
-  if (!_app->initialized())
+  // Return if the estimator has not accepted its initialize or we are within
+  // the first second after it. Use initialized_estimator() (not initialized())
+  // so odometry can flow during a stationary ZUPT ground hold, before the first
+  // full feature update has completed (same policy as the ROS2 visualizer).
+  if (!_app->initialized_estimator() || (timestamp - _app->initialized_time()) < 1)
     return;
 
   // Get fast propagate state at the desired timestamp
@@ -351,6 +386,10 @@ void ROS1Visualizer::visualize_odometry(double timestamp) {
 
 void ROS1Visualizer::visualize_final() {
 
+  // Stop the update worker before printing the final state so no worker thread
+  // can mutate the estimator concurrently with the final summary.
+  request_stop();
+
   // Final time offset value
   if (_app->get_state()->_options.do_calib_camera_timeoffset) {
     PRINT_INFO(REDPURPLE "camera-imu timeoffset = %.5f\n\n" RESET, _app->get_state()->_calib_dt_CAMtoIMU->value()(0));
@@ -440,59 +479,108 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   // convert into correct format
   ov_core::ImuData message;
   message.timestamp = msg->header.stamp.toSec();
-  message.wm << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
-  message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
+  if (imu_pre_filter_enable_) {
+    // vibration-robust pre-filter (T265): gyro LPF + accel median; the raw
+    // values pass through untouched when the pre-filter is disabled
+    double wm[3] = {msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z};
+    double am[3] = {msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z};
+    double fw[3], fa[3];
+    imu_pre_filter_.filter(wm, am, fw, fa);
+    message.wm << fw[0], fw[1], fw[2];
+    message.am << fa[0], fa[1], fa[2];
+  } else {
+    message.wm << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
+    message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
+  }
 
   // send it to our VIO system
   _app->feed_measurement_imu(message);
   visualize_odometry(message.timestamp);
 
-  // If the processing queue is currently active / running just return so we can keep getting measurements
-  // Otherwise create a second thread to do our update in an async manor
-  // The visualization of the state, images, and features will be synchronous with the update!
-  if (thread_update_running)
-    return;
-  thread_update_running = true;
-  std::thread thread([&] {
-    // Lock on the queue (prevents new images from appending)
+  // Wake the single background update worker with the newest IMU time. The
+  // timestamp is copied while holding the worker mutex; no callback-local
+  // reference is captured by an asynchronous thread.
+  {
+    std::lock_guard<std::mutex> lck(update_mtx_);
+    update_latest_imu_ts_ = message.timestamp;
+    update_pending_ = true;
+  }
+  update_cv_.notify_one();
+}
+
+void ROS1Visualizer::update_worker() {
+
+  while (true) {
+
+    // Wait for either a new IMU-triggered wake-up or a shutdown request.
+    double imu_timestamp = 0.0;
+    {
+      std::unique_lock<std::mutex> lck(update_mtx_);
+      update_cv_.wait(lck, [this] { return update_pending_ || update_stop_; });
+      if (update_stop_ && !update_pending_)
+        return;
+      update_pending_ = false;
+      imu_timestamp = update_latest_imu_ts_;
+    }
+
+    // Lock the queue while selecting and processing frames. This preserves
+    // the estimator's existing single-camera-update ordering.
     std::lock_guard<std::mutex> lck(camera_queue_mtx);
 
-    // Count how many unique image streams
     std::map<int, bool> unique_cam_ids;
     for (const auto &cam_msg : camera_queue) {
-      unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
+      for (const int sensor_id : cam_msg.sensor_ids)
+        unique_cam_ids[sensor_id] = true;
     }
 
-    // If we do not have enough unique cameras then we need to wait
-    // We should wait till we have one of each camera to ensure we propagate in the correct order
     auto params = _app->get_params();
-    size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
-    if (unique_cam_ids.size() == num_unique_cameras) {
+    // A stereo callback stores both camera ids in one CameraData object, while
+    // monocular callbacks store one id per object. In both cases all configured
+    // camera ids must be present before processing the queued measurement.
+    size_t num_unique_cameras = params.state_options.num_cameras;
+    if (unique_cam_ids.size() != num_unique_cameras)
+      continue;
 
-      // Loop through our queue and see if we are able to process any of our camera measurements
-      // We are able to process if we have at least one IMU measurement greater than the camera time
-      double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
-      while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
-        auto rT0_1 = boost::posix_time::microsec_clock::local_time();
-        double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
-        _app->feed_measurement_camera(camera_queue.at(0));
-        visualize();
-        camera_queue.pop_front();
-        auto rT0_2 = boost::posix_time::microsec_clock::local_time();
-        double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
-        PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
-      }
+    double timestamp_imu_inC = imu_timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+
+    // If processing falls behind the sensor stream, old frames are no longer
+    // useful to the tracker. Keep the newest processable frame.
+    while (camera_queue.size() > 1 && camera_queue.at(1).timestamp < timestamp_imu_inC)
+      camera_queue.pop_front();
+
+    while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
+      auto rT0_1 = boost::posix_time::microsec_clock::local_time();
+      const double camera_timestamp = camera_queue.at(0).timestamp;
+      double update_dt = 100.0 * (timestamp_imu_inC - camera_timestamp);
+      _app->feed_measurement_camera(camera_queue.at(0));
+      visualize();
+      camera_queue.pop_front();
+      auto rT0_2 = boost::posix_time::microsec_clock::local_time();
+      double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
+      PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total,
+                 time_total > 0.0 ? 1.0 / time_total : 0.0, update_dt);
     }
-    thread_update_running = false;
-  });
-
-  // If we are single threaded, then run single threaded
-  // Otherwise detach this thread so it runs in the background!
-  if (!_app->get_params().use_multi_threading_subs) {
-    thread.join();
-  } else {
-    thread.detach();
   }
+}
+
+void ROS1Visualizer::request_stop() {
+
+  {
+    std::lock_guard<std::mutex> lck(update_mtx_);
+    update_stop_ = true;
+    update_pending_ = false;
+  }
+  update_cv_.notify_all();
+  if (update_thread_.joinable())
+    update_thread_.join();
+
+  image_publish_stop_.store(true);
+  if (image_publish_thread_.joinable())
+    image_publish_thread_.join();
+}
+
+ROS1Visualizer::~ROS1Visualizer() {
+  request_stop();
 }
 
 void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, int cam_id0) {
@@ -532,6 +620,8 @@ void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, 
   std::lock_guard<std::mutex> lck(camera_queue_mtx);
   camera_queue.push_back(message);
   std::sort(camera_queue.begin(), camera_queue.end());
+  while (camera_queue.size() > kMaxPendingCameraMeasurements)
+    camera_queue.pop_front();
 }
 
 void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, const sensor_msgs::ImageConstPtr &msg1, int cam_id0,
@@ -586,6 +676,8 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
   std::lock_guard<std::mutex> lck(camera_queue_mtx);
   camera_queue.push_back(message);
   std::sort(camera_queue.begin(), camera_queue.end());
+  while (camera_queue.size() > kMaxPendingCameraMeasurements)
+    camera_queue.pop_front();
 }
 
 void ROS1Visualizer::publish_state() {
@@ -677,6 +769,16 @@ void ROS1Visualizer::publish_images() {
 }
 
 void ROS1Visualizer::publish_features() {
+
+  // Publish the count of features contributing to state estimation (msckf-good
+  // + slam) as a live VIO-health observable. This is deliberately BEFORE the
+  // cloud subscriber gate below so tracked_features consumers always get data;
+  // the message is 4 bytes so there is no reason to lazily gate it.
+  if (_app->initialized_estimator()) {
+    std_msgs::Int32 msg_feat;
+    msg_feat.data = static_cast<int32_t>(_app->get_good_features_MSCKF().size() + _app->get_features_SLAM().size());
+    pub_feat.publish(msg_feat);
+  }
 
   // Check if we have subscribers
   if (pub_points_msckf.getNumSubscribers() == 0 && pub_points_slam.getNumSubscribers() == 0 && pub_points_aruco.getNumSubscribers() == 0 &&

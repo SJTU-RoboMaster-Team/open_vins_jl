@@ -718,7 +718,7 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
   float size_y1 = (float)img1pyr.at(0).rows / (float)grid_y;
   cv::Size size_grid1(grid_x, grid_y); // width x height
   cv::Mat grid_2d_grid1 = cv::Mat::zeros(size_grid1, CV_8UC1);
-  cv::Mat mask1_updated = mask0.clone();
+  cv::Mat mask1_updated = mask1.clone();
   it0 = pts1.begin();
   it1 = ids1.begin();
   while (it0 != pts1.end()) {
@@ -872,9 +872,20 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
   double max_focallength = std::max(max_focallength_img0, max_focallength_img1);
   cv::findFundamentalMat(pts0_n, pts1_n, cv::FM_RANSAC, 2.0 / max_focallength, 0.999, mask_rsc);
 
+  // A stationary or nearly stationary sequence can make the fundamental
+  // matrix problem degenerate. In that case OpenCV may return no usable
+  // inlier mask even though the KLT tracks are valid. This is especially
+  // important during the static VIO initialization window.
+  size_t ransac_inliers = 0;
+  if (mask_rsc.size() == mask_klt.size()) {
+    for (const uchar inlier : mask_rsc)
+      ransac_inliers += (inlier != 0);
+  }
+  const bool use_ransac_mask = mask_rsc.size() == mask_klt.size() && ransac_inliers >= 8;
+
   // Loop through and record only ones that are valid
   for (size_t i = 0; i < mask_klt.size(); i++) {
-    auto mask = (uchar)((i < mask_klt.size() && mask_klt[i] && i < mask_rsc.size() && mask_rsc[i]) ? 1 : 0);
+    auto mask = (uchar)(mask_klt[i] && (!use_ransac_mask || mask_rsc[i]) ? 1 : 0);
     mask_out.push_back(mask);
   }
 
