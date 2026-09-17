@@ -23,6 +23,7 @@
 #define OV_CORE_FEATURE_HELPER_H
 
 #include <Eigen/Eigen>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -95,16 +96,7 @@ public:
     }
 
     // Compute mean and standard deviation in respect to it
-    disp_mean = 0;
-    for (double disp_i : disparities) {
-      disp_mean += disp_i;
-    }
-    disp_mean /= (double)disparities.size();
-    disp_var = 0;
-    for (double &disp_i : disparities) {
-      disp_var += std::pow(disp_i - disp_mean, 2);
-    }
-    disp_var = std::sqrt(disp_var / (double)(disparities.size() - 1));
+    summarize_disparities(disparities, disp_mean, disp_var);
     total_feats = (int)disparities.size();
   }
 
@@ -173,20 +165,33 @@ public:
     }
 
     // Compute mean and standard deviation in respect to it
-    disp_mean = 0;
-    for (double disp_i : disparities) {
-      disp_mean += disp_i;
-    }
-    disp_mean /= (double)disparities.size();
-    disp_var = 0;
-    for (double &disp_i : disparities) {
-      disp_var += std::pow(disp_i - disp_mean, 2);
-    }
-    disp_var = std::sqrt(disp_var / (double)(disparities.size() - 1));
+    summarize_disparities(disparities, disp_mean, disp_var);
     total_feats = (int)disparities.size();
   }
 
 private:
+  /**
+   * @brief Central tendency and spread of a set of per-feature disparities.
+   *
+   * The static-motion gates (initialization and zero-velocity update) compare
+   * this number against a few pixels. Two tracked positions of one feature are
+   * occasionally mismatched on repetitive texture, and with a long window a
+   * handful of such outliers adds tens of pixels to the arithmetic mean, so a
+   * motionless platform reads as moving and the gate never opens. The median
+   * ignores a minority of outliers while still growing with genuine motion.
+   */
+  static void summarize_disparities(const std::vector<double> &disparities, double &disp_mean, double &disp_var) {
+    std::vector<double> sorted(disparities);
+    const size_t middle = sorted.size() / 2;
+    std::nth_element(sorted.begin(), sorted.begin() + middle, sorted.end());
+    disp_mean = sorted[middle];
+    double squared_error = 0.0;
+    for (double disp_i : disparities) {
+      squared_error += (disp_i - disp_mean) * (disp_i - disp_mean);
+    }
+    disp_var = std::sqrt(squared_error / (double)(disparities.size() - 1));
+  }
+
   // Cannot construct this class
   FeatureHelper() {}
 };

@@ -92,26 +92,29 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   nh->param<bool>("publish_global_to_imu_tf", publish_global2imu_tf, true);
   nh->param<bool>("publish_calibration_tf", publish_calibration_tf, true);
 
-  // T265 vibration pre-filter (see ov_core/utils/ImuPreFilter.h). The T265
-  // united IMU stream is a fixed 199.94 Hz (firmware-interpolated); OpenVINS
-  // never parses the kalibr "update_rate" field, so this fs is a constant.
-  static constexpr double kImuPreFilterFsHz = 199.94;
+  // T265 vibration pre-filter (see ov_core/utils/ImuPreFilter.h). Default ON:
+  // this airframe's T265 is the reason the filter exists and its gyro low-pass
+  // coefficients are tied to the 199.94 Hz united IMU stream. A stream at a
+  // different rate (for example the 250 Hz Gazebo simulation IMU) must opt out
+  // explicitly, otherwise its gyro is filtered with the wrong cutoff.
   nh->param<bool>("imu_pre_filter_enable", imu_pre_filter_enable_, true);
   bool imu_gyro_lp_enable = true;
   double imu_gyro_lp_fc_hz = 30.0;
+  double imu_pre_filter_fs_hz = 199.94;
   int imu_acc_median_window = 3;
   nh->param<bool>("imu_gyro_lp_enable", imu_gyro_lp_enable, true);
   nh->param<double>("imu_gyro_lp_fc_hz", imu_gyro_lp_fc_hz, 30.0);
+  nh->param<double>("imu_pre_filter_fs_hz", imu_pre_filter_fs_hz, 199.94);
   nh->param<int>("imu_acc_median_window", imu_acc_median_window, 3);
   try {
-    imu_pre_filter_.configure(imu_gyro_lp_enable, kImuPreFilterFsHz, imu_gyro_lp_fc_hz, imu_acc_median_window);
+    imu_pre_filter_.configure(imu_gyro_lp_enable, imu_pre_filter_fs_hz, imu_gyro_lp_fc_hz, imu_acc_median_window);
   } catch (const std::exception &e) {
     imu_pre_filter_enable_ = false;
     PRINT_ERROR(RED "IMU pre-filter DISABLED due to bad config: %s\n" RESET, e.what());
   }
-  PRINT_INFO(REDPURPLE "IMU pre-filter: enable=%d gyro_lp=%d fc=%.1fHz acc_median=%d\n" RESET,
+  PRINT_INFO(REDPURPLE "IMU pre-filter: enable=%d gyro_lp=%d fc=%.1fHz fs=%.2fHz acc_median=%d\n" RESET,
              static_cast<int>(imu_pre_filter_enable_), static_cast<int>(imu_gyro_lp_enable), imu_gyro_lp_fc_hz,
-             imu_acc_median_window);
+             imu_pre_filter_fs_hz, imu_acc_median_window);
 
   // Load groundtruth if we have it and are not doing simulation
   // NOTE: needs to be a csv ASL format file
