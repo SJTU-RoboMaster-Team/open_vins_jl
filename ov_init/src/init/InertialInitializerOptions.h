@@ -72,6 +72,12 @@ struct InertialInitializerOptions {
   /// Number of features we should try to track
   int init_max_features = 50;
 
+  /// If true, re-define the gravity-aligned world yaw so that the body forward
+  /// at initialisation becomes world +x. gram_schmidt otherwise fixes the yaw
+  /// arbitrarily from gravity alone, which leaves the world frame unaligned
+  /// with any consumer that keeps its own heading.
+  bool init_align_yaw_to_heading = false;
+
   /// If we should perform dynamic initialization
   bool init_dyn_use = false;
 
@@ -128,6 +134,7 @@ struct InertialInitializerOptions {
       parser->parse_config("init_imu_thresh", init_imu_thresh);
       parser->parse_config("init_max_disparity", init_max_disparity);
       parser->parse_config("init_max_features", init_max_features);
+      parser->parse_config("init_align_yaw_to_heading", init_align_yaw_to_heading);
       parser->parse_config("init_dyn_use", init_dyn_use);
       parser->parse_config("init_dyn_mle_opt_calib", init_dyn_mle_opt_calib);
       parser->parse_config("init_dyn_mle_max_iter", init_dyn_mle_max_iter);
@@ -151,6 +158,7 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
     PRINT_DEBUG("  - init_max_disparity: %.2f\n", init_max_disparity);
     PRINT_DEBUG("  - init_max_features: %d\n", init_max_features);
+    PRINT_DEBUG("  - init_align_yaw_to_heading: %d\n", init_align_yaw_to_heading);
     if (init_max_features < 15) {
       PRINT_ERROR(RED "number of requested feature tracks to init not enough!!\n" RESET);
       PRINT_ERROR(RED "  init_max_features = %d\n" RESET, init_max_features);

@@ -298,6 +298,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     }
     if (did_zupt_update) {
       assert(state->_timestamp == message.timestamp);
+      zupt_last_timestamp = message.timestamp;
       propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       propagator->invalidate_cache();
@@ -494,6 +495,19 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
   }
 
+  // A window that still contains pre-ZUPT clones holds features whose
+  // observations at those clone times were already stripped, so any update they
+  // produce is built on an inconsistent set. Skip the visual updates until the
+  // window has fully refreshed; the state dead-reckons for a few frames, which
+  // is far cheaper than folding a bad update into it.
+  if (params.zupt_skip_stale_window && zupt_last_timestamp > 0.0 && state->margtimestep() < zupt_last_timestamp) {
+    feats_lost.clear();
+    feats_marg.clear();
+    feats_maxtracks.clear();
+    feats_slam_UPDATE.clear();
+    feats_slam_DELAYED.clear();
+  }
+
   // Concatenate our MSCKF feature arrays (i.e., ones not being used for slam updates)
   std::vector<std::shared_ptr<Feature>> featsup_MSCKF = feats_lost;
   featsup_MSCKF.insert(featsup_MSCKF.end(), feats_marg.begin(), feats_marg.end());
@@ -522,6 +536,10 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
+  // TEMP DIAG (remove before commit): MSCKF input sizes and window state.
+  PRINT_INFO(YELLOW "[tmpVM] clones=%zu marg_t=%.3f t=%.3f | lost=%zu marg=%zu maxtr=%zu slam=%zu\n" RESET,
+             state->_clones_IMU.size(), state->margtimestep(), state->_timestamp, feats_lost.size(), feats_marg.size(),
+             feats_maxtracks.size(), feats_slam.size());
   updaterMSCKF->update(state, featsup_MSCKF);
   propagator->invalidate_cache();
   rT4 = boost::posix_time::microsec_clock::local_time();

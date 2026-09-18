@@ -235,6 +235,11 @@ protected:
   bool did_zupt_update = false;
   bool has_moved_since_zupt = false;
 
+  /// Timestamp of the most recent accepted zero-velocity update, or -1 when
+  /// none has happened. Clones older than this predate the ground hold and
+  /// their measurements were stripped, so MSCKF must not consume them.
+  double zupt_last_timestamp = -1;
+
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;
 

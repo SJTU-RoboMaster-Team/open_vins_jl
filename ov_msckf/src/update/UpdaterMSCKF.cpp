@@ -57,9 +57,15 @@ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerO
 
 void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
 
+  // TEMP DIAG (remove before commit): count why features are dropped.
+  size_t tmp_n_in = feature_vec.size();
+  size_t tmp_ct = 0, tmp_tri = 0, tmp_chi2 = 0;
+
   // Return if no features
-  if (feature_vec.empty())
+  if (feature_vec.empty()) {
+    PRINT_INFO(YELLOW "[tmpMSCKF] in=0 ct=0 tri=0 chi2=0 ok=0\n" RESET);
     return;
+  }
 
   // Start timing
   boost::posix_time::ptime rT0, rT1, rT2, rT3, rT4, rT5;
@@ -86,6 +92,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Remove if we don't have enough
     if (ct_meas < 2) {
+      tmp_ct++;
       (*it0)->to_delete = true;
       it0 = feature_vec.erase(it0);
     } else {
@@ -134,6 +141,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Remove the feature if not a success
     if (!success_tri || !success_refine) {
+      tmp_tri++;
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);
       continue;
@@ -223,6 +231,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Check if we should delete or not
     if (chi2 > _options.chi2_multipler * chi2_check) {
+      tmp_chi2++;
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
       // PRINT_DEBUG("featid = %d\n", feat.featid);
@@ -255,6 +264,10 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     it2++;
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
+
+  // TEMP DIAG (remove before commit)
+  PRINT_INFO(YELLOW "[tmpMSCKF] in=%zu ct=%zu tri=%zu chi2=%zu ok=%zu\n" RESET, tmp_n_in, tmp_ct, tmp_tri, tmp_chi2,
+             feature_vec.size());
 
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information

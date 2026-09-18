@@ -32,12 +32,20 @@ zupt_max_disparity: 0.5
 # disparity is still non-zero; applying a zero-velocity update then corrupts
 # the moving trajectory and can cause eventual visual lock loss.
 zupt_only_at_beginning: true
+# The ground hold lets ZUPT advance state time without creating clones, so at
+# motion onset the window still holds pre-ZUPT clones whose measurements were
+# stripped. Skip the visual updates until the window has refreshed.
+zupt_skip_stale_window: true
 init_window_time: 2.0
 init_imu_thresh: 1.0
 # Use the visual motion gate during initialization; FeatureHelper handles the
 # simulator timestamp boundary inclusively for both initialization windows.
 init_max_disparity: 0.5
 init_max_features: 100
+# The gravity-aligned world yaw from gram_schmidt is arbitrary. Align it to the
+# initial body heading so the relay's ENU output matches PX4's local frame,
+# which keeps its own heading under position-only EKF2_EV_CTRL fusion.
+init_align_yaw_to_heading: true
 # The flight controller waits for a stationary, initialized VIO before
 # takeoff. Dynamic initialization needs deliberate attitude excitation and
 # must not be used with the ground-hold startup sequence.
@@ -70,7 +78,10 @@ downsize_aruco: false
 # host. OpenVINS scales the images and intrinsics consistently when enabled.
 downsample_cameras: true
 histogram_method: "HISTOGRAM"
-track_frequency: 20.0
+# The camera publishes at ~32 Hz. A lower ceiling drops every other frame, which
+# doubles the inter-frame image motion and costs KLT tracks, so keep it above
+# the sensor rate.
+track_frequency: 40.0
 num_pts: 250
 fast_threshold: 12
 grid_x: 20

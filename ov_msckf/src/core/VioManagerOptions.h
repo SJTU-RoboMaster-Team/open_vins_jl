@@ -94,6 +94,12 @@ struct VioManagerOptions {
   /// If we should only use the zupt at the very beginning static initialization phase
   bool zupt_only_at_beginning = false;
 
+  /// If true, skip the visual updates while the clone window still contains
+  /// clones older than the most recent zero-velocity update. Those clones
+  /// predate the ground hold and their measurements were stripped, so using
+  /// them feeds an inconsistent update into the filter.
+  bool zupt_skip_stale_window = false;
+
   /// If we should record the timing performance to file
   bool record_timing_information = false;
 
@@ -117,6 +123,7 @@ struct VioManagerOptions {
       parser->parse_config("zupt_noise_multiplier", zupt_noise_multiplier);
       parser->parse_config("zupt_max_disparity", zupt_max_disparity);
       parser->parse_config("zupt_only_at_beginning", zupt_only_at_beginning);
+      parser->parse_config("zupt_skip_stale_window", zupt_skip_stale_window);
       parser->parse_config("record_timing_information", record_timing_information);
       parser->parse_config("record_timing_filepath", record_timing_filepath);
     }
@@ -126,6 +133,7 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - zupt_noise_multiplier: %.2f\n", zupt_noise_multiplier);
     PRINT_DEBUG("  - zupt_max_disparity: %.4f\n", zupt_max_disparity);
     PRINT_DEBUG("  - zupt_only_at_beginning?: %d\n", zupt_only_at_beginning);
+    PRINT_DEBUG("  - zupt_skip_stale_window: %d\n", zupt_skip_stale_window);
     PRINT_DEBUG("  - record timing?: %d\n", (int)record_timing_information);
     PRINT_DEBUG("  - record timing filepath: %s\n", record_timing_filepath.c_str());
   }

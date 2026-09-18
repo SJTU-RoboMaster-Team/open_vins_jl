@@ -124,6 +124,16 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   InitializerHelper::gram_schmidt(z_axis, Ro);
   Eigen::Vector4d q_GtoI = rot_2_quat(Ro);
 
+  // gram_schmidt fixes the world yaw arbitrarily from gravity alone, so the
+  // world frame shares no heading with the body. Rotate the world about gravity
+  // until the body forward at initialisation is world +x, which is the heading
+  // convention a position-only external-vision consumer assumes.
+  if (params.init_align_yaw_to_heading) {
+    Eigen::Matrix3d R_GtoI = quat_2_Rot(q_GtoI);
+    Eigen::Vector3d forward_in_G = R_GtoI.transpose() * Eigen::Vector3d::UnitX();
+    q_GtoI = rot_2_quat(R_GtoI * ov_core::rot_z(std::atan2(forward_in_G.y(), forward_in_G.x())));
+  }
+
   // Set our biases equal to our noise (subtract our gravity from accelerometer bias)
   Eigen::Vector3d gravity_inG;
   gravity_inG << 0.0, 0.0, params.gravity_mag;
