@@ -51,6 +51,8 @@
 #include <boost/filesystem.hpp>
 #include <cv_bridge/cv_bridge.h>
 
+#include "utils/ImuPreFilter.h"
+
 namespace ov_core {
 class YamlParser;
 struct CameraData;
@@ -171,6 +173,13 @@ protected:
 
   // Thread atomics
   std::atomic<bool> thread_update_running;
+
+  // Optional T265 vibration pre-filter. Disabled by default; experiments
+  // enable it through private ROS parameters without changing the estimator
+  // YAML or the stock replay behavior.
+  ov_core::ImuPreFilter imu_pre_filter_;
+  bool imu_pre_filter_enable_ = false;
+  bool imu_pre_filter_active_ = false;
 
   /// Queue up camera measurements sorted by time and trigger once we have
   /// exactly one IMU measurement with timestamp newer than the camera measurement

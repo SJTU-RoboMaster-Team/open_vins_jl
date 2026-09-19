@@ -191,6 +191,52 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
   _node->declare_parameter<std::string>("topic_imu", "/imu0");
   _node->get_parameter("topic_imu", topic_imu);
   parser->parse_external("relative_config_imu", "imu0", "rostopic", topic_imu);
+
+  // Optional vibration filter experiment. Keep every option off by default so
+  // the normal Gazebo estimator is bit-for-bit on the same input path. The
+  // filter is deliberately gated by _app->initialized() in callback_inertial:
+  // initialization still sees raw IMU data, then the filter is reset and
+  // enabled for post-initialization propagation only.
+  bool gyro_lp_enable = false;
+  double gyro_lp_fc_hz = 30.0;
+  bool gyro_notch_enable = false;
+  double gyro_notch_hz = 93.0;
+  double gyro_notch_q = 8.0;
+  int acc_median_window = 0;
+  double imu_filter_fs_hz = 250.0;
+  auto declare_if_missing = [this](const std::string &name, const auto &value) {
+    if (!_node->has_parameter(name))
+      _node->declare_parameter(name, value);
+  };
+  declare_if_missing("imu_pre_filter_enable", false);
+  declare_if_missing("imu_gyro_lp_enable", gyro_lp_enable);
+  declare_if_missing("imu_gyro_lp_fc_hz", gyro_lp_fc_hz);
+  declare_if_missing("imu_gyro_notch_enable", gyro_notch_enable);
+  declare_if_missing("imu_gyro_notch_hz", gyro_notch_hz);
+  declare_if_missing("imu_gyro_notch_q", gyro_notch_q);
+  declare_if_missing("imu_acc_median_window", acc_median_window);
+  declare_if_missing("imu_filter_fs_hz", imu_filter_fs_hz);
+  _node->get_parameter("imu_pre_filter_enable", imu_pre_filter_enable_);
+  _node->get_parameter("imu_gyro_lp_enable", gyro_lp_enable);
+  _node->get_parameter("imu_gyro_lp_fc_hz", gyro_lp_fc_hz);
+  _node->get_parameter("imu_gyro_notch_enable", gyro_notch_enable);
+  _node->get_parameter("imu_gyro_notch_hz", gyro_notch_hz);
+  _node->get_parameter("imu_gyro_notch_q", gyro_notch_q);
+  _node->get_parameter("imu_acc_median_window", acc_median_window);
+  _node->get_parameter("imu_filter_fs_hz", imu_filter_fs_hz);
+  if (imu_pre_filter_enable_) {
+    try {
+      imu_pre_filter_.configure(gyro_lp_enable, imu_filter_fs_hz, gyro_lp_fc_hz, acc_median_window,
+                                gyro_notch_enable, gyro_notch_hz, gyro_notch_q);
+    } catch (const std::exception &e) {
+      PRINT_ERROR(RED "Invalid IMU pre-filter parameters: %s\n" RESET, e.what());
+      imu_pre_filter_enable_ = false;
+    }
+  }
+  PRINT_INFO("IMU pre-filter: enable=%d gyro_lp=%d fc=%.1fHz notch=%d@%.1fHz Q=%.2f acc_median=%d fs=%.2fHz\n",
+             static_cast<int>(imu_pre_filter_enable_), static_cast<int>(gyro_lp_enable), gyro_lp_fc_hz,
+             static_cast<int>(gyro_notch_enable), gyro_notch_hz, gyro_notch_q, acc_median_window, imu_filter_fs_hz);
+
   // Reliable IMU delivery with a deep history. The old best-effort path could
   // silently drop 250 Hz samples under SITL/load, leaving Propagator with a
   // truncated measurement window. The bridge publishes the matching reliable QoS.
@@ -491,8 +537,29 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
   // convert into correct format
   ov_core::ImuData message;
   message.timestamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
-  message.wm << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
-  message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
+
+  // Keep the initializer on the raw stream. Once OpenVINS reports that it is
+  // initialized, seed/reset the causal filter and apply it to propagation.
+  // Camera measurements are still used throughout initialization; "raw IMU"
+  // only means that this callback bypasses the optional pre-filter.
+  const bool apply_imu_pre_filter = imu_pre_filter_enable_ && _app->initialized();
+  if (apply_imu_pre_filter && !imu_pre_filter_active_) {
+    imu_pre_filter_.reset();
+    imu_pre_filter_active_ = true;
+  } else if (!apply_imu_pre_filter) {
+    imu_pre_filter_active_ = false;
+  }
+  if (apply_imu_pre_filter) {
+    const double wm[3] = {msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z};
+    const double am[3] = {msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z};
+    double filtered_wm[3], filtered_am[3];
+    imu_pre_filter_.filter(wm, am, filtered_wm, filtered_am);
+    message.wm << filtered_wm[0], filtered_wm[1], filtered_wm[2];
+    message.am << filtered_am[0], filtered_am[1], filtered_am[2];
+  } else {
+    message.wm << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
+    message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
+  }
 
   // send it to our VIO system
   _app->feed_measurement_imu(message);

@@ -59,6 +59,10 @@ install(DIRECTORY src/
         DESTINATION include
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
 )
+# Keep this explicit so an incremental build also installs the optional IMU
+# pre-filter header before ov_msckf consumes it through the exported ov_core
+# include path.
+install(FILES src/utils/ImuPreFilter.h DESTINATION include/utils)
 ament_export_include_directories(include)
 ament_export_libraries(ov_core_lib)
 

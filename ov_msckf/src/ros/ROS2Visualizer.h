@@ -59,6 +59,8 @@
 #include <boost/filesystem.hpp>
 #include <cv_bridge/cv_bridge.h>
 
+#include "utils/ImuPreFilter.h"
+
 namespace ov_core {
 class YamlParser;
 struct CameraData;
@@ -218,6 +220,14 @@ protected:
   std::mutex processing_fps_mtx_;
   std::deque<std::chrono::steady_clock::time_point> processed_camera_frames_;
   double processing_fps_ = 0.0;
+
+  // Optional causal IMU pre-filter. It is disabled by default and, when
+  // enabled, remains bypassed until OpenVINS has completed initialization.
+  // This keeps the Gazebo baseline unchanged while allowing an adaptive
+  // narrow-band gyro-notch experiment.
+  ov_core::ImuPreFilter imu_pre_filter_;
+  bool imu_pre_filter_enable_ = false;
+  bool imu_pre_filter_active_ = false;
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;

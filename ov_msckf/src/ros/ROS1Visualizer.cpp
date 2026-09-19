@@ -84,6 +84,34 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   nh->param<bool>("publish_global_to_imu_tf", publish_global2imu_tf, true);
   nh->param<bool>("publish_calibration_tf", publish_calibration_tf, true);
 
+  // Optional vibration handling for T265 replays. The united stream is about
+  // 200 Hz; use a causal gyro low-pass and only a short accel median so that
+  // isolated transport glitches are removed without filtering the accel's
+  // already-interpolated dynamics. Parameters are private to this node.
+  bool gyro_lp_enable = true;
+  double gyro_lp_fc_hz = 8.0;
+  bool gyro_notch_enable = false;
+  double gyro_notch_hz = 93.0;
+  double gyro_notch_q = 8.0;
+  int acc_median_window = 3;
+  nh->param<bool>("imu_pre_filter_enable", imu_pre_filter_enable_, false);
+  nh->param<bool>("imu_gyro_lp_enable", gyro_lp_enable, true);
+  nh->param<double>("imu_gyro_lp_fc_hz", gyro_lp_fc_hz, 8.0);
+  nh->param<bool>("imu_gyro_notch_enable", gyro_notch_enable, false);
+  nh->param<double>("imu_gyro_notch_hz", gyro_notch_hz, 93.0);
+  nh->param<double>("imu_gyro_notch_q", gyro_notch_q, 8.0);
+  nh->param<int>("imu_acc_median_window", acc_median_window, 3);
+  try {
+    imu_pre_filter_.configure(gyro_lp_enable, 199.94, gyro_lp_fc_hz, acc_median_window,
+                               gyro_notch_enable, gyro_notch_hz, gyro_notch_q);
+  } catch (const std::exception &e) {
+    imu_pre_filter_enable_ = false;
+    PRINT_ERROR(RED "IMU pre-filter disabled: %s\n" RESET, e.what());
+  }
+  PRINT_INFO(REDPURPLE "IMU pre-filter: enable=%d gyro_lp=%d fc=%.1fHz notch=%d@%.1fHz Q=%.2f acc_median=%d\n" RESET,
+             static_cast<int>(imu_pre_filter_enable_), static_cast<int>(gyro_lp_enable), gyro_lp_fc_hz,
+             static_cast<int>(gyro_notch_enable), gyro_notch_hz, gyro_notch_q, acc_median_window);
+
   // Load groundtruth if we have it and are not doing simulation
   // NOTE: needs to be a csv ASL format file
   if (nh->hasParam("path_gt") && _sim == nullptr) {
@@ -440,8 +468,28 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   // convert into correct format
   ov_core::ImuData message;
   message.timestamp = msg->header.stamp.toSec();
-  message.wm << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
-  message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
+  // Keep the dynamic initializer on the raw united stream. A vibration
+  // filter can otherwise change the excitation/noise statistics used to
+  // recover the initial attitude and biases. Once OpenVINS reports that it
+  // is initialized, seed the filter and enable it for normal propagation.
+  const bool apply_imu_pre_filter = imu_pre_filter_enable_ && _app->initialized();
+  if (apply_imu_pre_filter && !imu_pre_filter_active_) {
+    imu_pre_filter_.reset();
+    imu_pre_filter_active_ = true;
+  } else if (!apply_imu_pre_filter) {
+    imu_pre_filter_active_ = false;
+  }
+  if (apply_imu_pre_filter) {
+    double wm[3] = {msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z};
+    double am[3] = {msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z};
+    double filtered_wm[3], filtered_am[3];
+    imu_pre_filter_.filter(wm, am, filtered_wm, filtered_am);
+    message.wm << filtered_wm[0], filtered_wm[1], filtered_wm[2];
+    message.am << filtered_am[0], filtered_am[1], filtered_am[2];
+  } else {
+    message.wm << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
+    message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
+  }
 
   // send it to our VIO system
   _app->feed_measurement_imu(message);
