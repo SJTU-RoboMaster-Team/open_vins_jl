@@ -94,6 +94,7 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   double gyro_notch_hz = 93.0;
   double gyro_notch_q = 8.0;
   int acc_median_window = 3;
+  double imu_filter_fs_hz = 199.94;
   nh->param<bool>("imu_pre_filter_enable", imu_pre_filter_enable_, false);
   nh->param<bool>("imu_gyro_lp_enable", gyro_lp_enable, true);
   nh->param<double>("imu_gyro_lp_fc_hz", gyro_lp_fc_hz, 8.0);
@@ -101,16 +102,17 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   nh->param<double>("imu_gyro_notch_hz", gyro_notch_hz, 93.0);
   nh->param<double>("imu_gyro_notch_q", gyro_notch_q, 8.0);
   nh->param<int>("imu_acc_median_window", acc_median_window, 3);
+  nh->param<double>("imu_filter_fs_hz", imu_filter_fs_hz, 199.94);
   try {
-    imu_pre_filter_.configure(gyro_lp_enable, 199.94, gyro_lp_fc_hz, acc_median_window,
+    imu_pre_filter_.configure(gyro_lp_enable, imu_filter_fs_hz, gyro_lp_fc_hz, acc_median_window,
                                gyro_notch_enable, gyro_notch_hz, gyro_notch_q);
   } catch (const std::exception &e) {
     imu_pre_filter_enable_ = false;
     PRINT_ERROR(RED "IMU pre-filter disabled: %s\n" RESET, e.what());
   }
-  PRINT_INFO(REDPURPLE "IMU pre-filter: enable=%d gyro_lp=%d fc=%.1fHz notch=%d@%.1fHz Q=%.2f acc_median=%d\n" RESET,
+  PRINT_INFO(REDPURPLE "IMU pre-filter: enable=%d gyro_lp=%d fc=%.1fHz notch=%d@%.1fHz Q=%.2f acc_median=%d fs=%.2fHz\n" RESET,
              static_cast<int>(imu_pre_filter_enable_), static_cast<int>(gyro_lp_enable), gyro_lp_fc_hz,
-             static_cast<int>(gyro_notch_enable), gyro_notch_hz, gyro_notch_q, acc_median_window);
+             static_cast<int>(gyro_notch_enable), gyro_notch_hz, gyro_notch_q, acc_median_window, imu_filter_fs_hz);
 
   // Load groundtruth if we have it and are not doing simulation
   // NOTE: needs to be a csv ASL format file
