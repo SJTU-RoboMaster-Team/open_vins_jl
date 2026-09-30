@@ -298,6 +298,15 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     }
     if (did_zupt_update) {
       assert(state->_timestamp == message.timestamp);
+      // A successful ZUPT is a complete estimator update even though it
+      // returns before do_feature_propagate_update(). Mark the first such
+      // update so initialized() can release odometry/pose publishers during
+      // a stationary start; otherwise timelastupdate stays at -1 until the
+      // vehicle moves and downstream consumers never receive the pose needed
+      // to start it.
+      if (timelastupdate == -1) {
+        timelastupdate = message.timestamp;
+      }
       propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       propagator->invalidate_cache();
