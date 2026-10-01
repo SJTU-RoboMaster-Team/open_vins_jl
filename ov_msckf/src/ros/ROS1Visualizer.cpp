@@ -905,6 +905,14 @@ void ROS1Visualizer::publish_loopclosure_information() {
   Eigen::Vector3d pos = _app->get_state()->_clones_IMU.at(active_tracks_time1)->pos();
   if (active_tracks_time1 != active_tracks_time2)
     return;
+  // Keep the ROS1 split-simulation output rate aligned with the ROS2 visualizer.
+  // The estimator updates on IMU messages, but loop fusion only needs one
+  // synchronized image/feature/pose sample every 0.2 seconds.
+  if (last_loopclosure_publish_time >= 0.0 &&
+      active_tracks_time1 >= last_loopclosure_publish_time &&
+      active_tracks_time1 - last_loopclosure_publish_time < 0.2)
+    return;
+  last_loopclosure_publish_time = active_tracks_time1;
 
   // Default header
   std_msgs::Header header;
@@ -949,6 +957,8 @@ void ROS1Visualizer::publish_loopclosure_information() {
     sensor_msgs::CameraInfo cameraparams;
     cameraparams.header = header;
     cameraparams.header.frame_id = "cam0";
+    cameraparams.width = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->w());
+    cameraparams.height = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->h());
     cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
     Eigen::VectorXd cparams = _app->get_state()->_cam_intrinsics.at(0)->value();
     cameraparams.D = {cparams(4), cparams(5), cparams(6), cparams(7)};

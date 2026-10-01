@@ -1088,6 +1088,8 @@ void ROS2Visualizer::publish_loopclosure_information() {
     sensor_msgs::msg::CameraInfo cameraparams;
     cameraparams.header = calibration_header;
     cameraparams.header.frame_id = "cam0";
+    cameraparams.width = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->w());
+    cameraparams.height = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->h());
     cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
     Eigen::VectorXd cparams = _app->get_state()->_cam_intrinsics.at(0)->value();
     cameraparams.d = {cparams(4), cparams(5), cparams(6), cparams(7)};
