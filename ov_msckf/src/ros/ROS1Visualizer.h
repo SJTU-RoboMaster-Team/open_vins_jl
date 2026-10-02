@@ -188,6 +188,10 @@ protected:
   /// a nice feature to have for general robustness to bad camera drivers.
   std::deque<ov_core::CameraData> camera_queue;
   std::mutex camera_queue_mtx;
+  // Optional tolerance for treating near-synchronous monocular cameras as one
+  // estimator update. Zero preserves the stock one-message-per-update behavior.
+  double camera_sync_tolerance_s_ = 0.0;
+  size_t camera_sync_bundle_count_ = 0;
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;

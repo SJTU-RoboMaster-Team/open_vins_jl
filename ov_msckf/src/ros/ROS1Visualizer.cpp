@@ -31,6 +31,8 @@
 #include "utils/print.h"
 #include "utils/sensor_data.h"
 
+#include <cmath>
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
@@ -40,6 +42,15 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
 
   // Setup our transform broadcaster
   mTfBr = std::make_shared<tf::TransformBroadcaster>();
+
+  nh->param<double>("camera_sync_tolerance_s", camera_sync_tolerance_s_, 0.0);
+  if (!std::isfinite(camera_sync_tolerance_s_) || camera_sync_tolerance_s_ < 0.0) {
+    PRINT_ERROR("Invalid camera_sync_tolerance_s; disabling camera bundling\n");
+    camera_sync_tolerance_s_ = 0.0;
+  }
+  if (camera_sync_tolerance_s_ > 0.0) {
+    PRINT_INFO("Near-synchronous camera bundling enabled (tolerance %.3f s)\n", camera_sync_tolerance_s_);
+  }
 
   // Create image transport
   image_transport::ImageTransport it(*_nh);
@@ -519,15 +530,82 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
     size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
     if (unique_cam_ids.size() == num_unique_cameras) {
 
-      // Loop through our queue and see if we are able to process any of our camera measurements
-      // We are able to process if we have at least one IMU measurement greater than the camera time
+      // Loop through our queue and see if we are able to process any of our camera measurements.
+      // In the four-camera Seeker4 simulation, images within the configured
+      // tolerance are one CameraData update so they augment a single clone.
       double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
-      while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
+      while (!camera_queue.empty()) {
+        const ov_core::CameraData first_message = camera_queue.front();
+        if (first_message.timestamp >= timestamp_imu_inC)
+          break;
+
+        ov_core::CameraData update_message = first_message;
+        std::vector<size_t> consumed_indices{0};
+        bool bundled = false;
+        double bundle_span = 0.0;
+
+        const size_t expected_cameras = params.state_options.num_cameras;
+        if (camera_sync_tolerance_s_ > 0.0 && expected_cameras > 2 && first_message.sensor_ids.size() == 1) {
+          const double group_end = first_message.timestamp + camera_sync_tolerance_s_;
+          std::map<int, size_t> group_members;
+          for (size_t index = 0; index < camera_queue.size(); ++index) {
+            const auto &candidate = camera_queue.at(index);
+            if (candidate.timestamp > group_end)
+              break;
+            if (candidate.sensor_ids.size() != 1)
+              continue;
+            const int camera_id = candidate.sensor_ids.front();
+            if (camera_id < 0 || static_cast<size_t>(camera_id) >= expected_cameras)
+              continue;
+            group_members.emplace(camera_id, index);
+          }
+
+          if (group_members.size() == expected_cameras) {
+            double latest_timestamp = first_message.timestamp;
+            double timestamp_sum = 0.0;
+            update_message.sensor_ids.clear();
+            update_message.images.clear();
+            update_message.masks.clear();
+            consumed_indices.clear();
+            for (const auto &member : group_members) {
+              const auto &camera_message = camera_queue.at(member.second);
+              latest_timestamp = std::max(latest_timestamp, camera_message.timestamp);
+              timestamp_sum += camera_message.timestamp;
+              update_message.sensor_ids.push_back(member.first);
+              update_message.images.push_back(camera_message.images.front());
+              update_message.masks.push_back(camera_message.masks.front());
+              consumed_indices.push_back(member.second);
+            }
+            // CameraData has one timestamp for every image. The mean minimizes
+            // the maximum timestamp adjustment within this bounded group.
+            update_message.timestamp = timestamp_sum / static_cast<double>(group_members.size());
+            bundle_span = latest_timestamp - first_message.timestamp;
+            if (latest_timestamp >= timestamp_imu_inC)
+              break;
+            bundled = true;
+          } else if (timestamp_imu_inC <= group_end) {
+            // Give the remaining camera callbacks time to arrive before falling
+            // back to the first individual image.
+            break;
+          }
+        }
+
         auto rT0_1 = boost::posix_time::microsec_clock::local_time();
-        double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
-        _app->feed_measurement_camera(camera_queue.at(0));
+        double update_dt = 100.0 * (timestamp_imu_inC - update_message.timestamp);
+        _app->feed_measurement_camera(update_message);
         visualize();
-        camera_queue.pop_front();
+        if (bundled) {
+          std::sort(consumed_indices.begin(), consumed_indices.end());
+          for (auto index = consumed_indices.rbegin(); index != consumed_indices.rend(); ++index) {
+            camera_queue.erase(camera_queue.begin() + *index);
+          }
+          ++camera_sync_bundle_count_;
+          if (camera_sync_bundle_count_ % 100 == 1) {
+            PRINT_INFO("Camera sync bundles: %zu (latest span %.3f s)\n", camera_sync_bundle_count_, bundle_span);
+          }
+        } else {
+          camera_queue.pop_front();
+        }
         auto rT0_2 = boost::posix_time::microsec_clock::local_time();
         double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
         PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
