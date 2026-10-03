@@ -1056,11 +1056,15 @@ void ROS1Visualizer::publish_loopclosure_information() {
 
       // Get this feature information
       size_t featid = feattimes.first;
-      Eigen::Vector3d uvd = Eigen::Vector3d::Zero();
-      if (active_tracks_uvd.find(featid) != active_tracks_uvd.end()) {
-        uvd = active_tracks_uvd.at(featid);
-      }
+      // The 3D set contains tracks from all cameras, but loop_image is cam0.
+      // Missing cam0 observations must not become fabricated (0,0) matches.
+      const auto observation = active_tracks_uvd.find(featid);
+      if (observation == active_tracks_uvd.end())
+        continue;
+      const Eigen::Vector3d &uvd = observation->second;
       Eigen::Vector3d pFinG = active_tracks_posinG.at(featid);
+      if (!uvd.allFinite() || uvd(2) < 0.1 || !pFinG.allFinite())
+        continue;
 
       // Push back 3d point
       geometry_msgs::Point32 p;
