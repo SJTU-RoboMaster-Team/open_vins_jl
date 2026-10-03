@@ -30,6 +30,7 @@
 #include "utils/dataset_reader.h"
 #include "utils/print.h"
 #include "utils/sensor_data.h"
+#include "utils/camera_sync.h"
 
 #include <cmath>
 
@@ -511,10 +512,11 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   // If the processing queue is currently active / running just return so we can keep getting measurements
   // Otherwise create a second thread to do our update in an async manor
   // The visualization of the state, images, and features will be synchronous with the update!
-  if (thread_update_running)
+  if (thread_update_running.exchange(true))
     return;
-  thread_update_running = true;
-  std::thread thread([&] {
+  // The asynchronous update must not retain the callback's stack message.
+  const double latest_imu_timestamp = message.timestamp;
+  std::thread thread([this, latest_imu_timestamp] {
     // Lock on the queue (prevents new images from appending)
     std::lock_guard<std::mutex> lck(camera_queue_mtx);
 
@@ -533,7 +535,7 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
       // Loop through our queue and see if we are able to process any of our camera measurements.
       // In the four-camera Seeker4 simulation, images within the configured
       // tolerance are one CameraData update so they augment a single clone.
-      double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+      double timestamp_imu_inC = latest_imu_timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
       while (!camera_queue.empty()) {
         const ov_core::CameraData first_message = camera_queue.front();
         if (first_message.timestamp >= timestamp_imu_inC)
@@ -548,16 +550,17 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
         if (camera_sync_tolerance_s_ > 0.0 && expected_cameras > 2 && first_message.sensor_ids.size() == 1) {
           const double group_end = first_message.timestamp + camera_sync_tolerance_s_;
           std::map<int, size_t> group_members;
+          std::map<int, double> latest_queued_stamp;
           for (size_t index = 0; index < camera_queue.size(); ++index) {
             const auto &candidate = camera_queue.at(index);
-            if (candidate.timestamp > group_end)
-              break;
             if (candidate.sensor_ids.size() != 1)
               continue;
             const int camera_id = candidate.sensor_ids.front();
             if (camera_id < 0 || static_cast<size_t>(camera_id) >= expected_cameras)
               continue;
-            group_members.emplace(camera_id, index);
+            latest_queued_stamp[camera_id] = candidate.timestamp;
+            if (candidate.timestamp <= group_end)
+              group_members.emplace(camera_id, index);
           }
 
           if (group_members.size() == expected_cameras) {
@@ -583,15 +586,16 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
             if (latest_timestamp >= timestamp_imu_inC)
               break;
             bundled = true;
-          } else if (timestamp_imu_inC <= group_end) {
-            // Give the remaining camera callbacks time to arrive before falling
-            // back to the first individual image.
+          } else if (camera_bundle_wait_for_missing(expected_cameras, group_members, latest_queued_stamp, group_end)) {
+            // IMU time can already be ahead while the remaining camera
+            // callbacks are in transport. Only newer queued images from every
+            // missing camera prove this group can no longer become complete.
             break;
           }
         }
 
         auto rT0_1 = boost::posix_time::microsec_clock::local_time();
-        double update_dt = 100.0 * (timestamp_imu_inC - update_message.timestamp);
+        double update_dt = 1000.0 * (timestamp_imu_inC - update_message.timestamp);
         _app->feed_measurement_camera(update_message);
         visualize();
         if (bundled) {
@@ -628,10 +632,13 @@ void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, 
   // Check if we should drop this image
   double timestamp = msg0->header.stamp.toSec();
   double time_delta = 1.0 / _app->get_params().track_frequency;
-  if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
-    return;
+  {
+    std::lock_guard<std::mutex> timestamp_lock(camera_last_timestamp_mtx);
+    if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
+      return;
+    }
+    camera_last_timestamp[cam_id0] = timestamp;
   }
-  camera_last_timestamp[cam_id0] = timestamp;
 
   // Get the image
   cv_bridge::CvImageConstPtr cv_ptr;
@@ -668,10 +675,13 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
   // Check if we should drop this image
   double timestamp = msg0->header.stamp.toSec();
   double time_delta = 1.0 / _app->get_params().track_frequency;
-  if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
-    return;
+  {
+    std::lock_guard<std::mutex> timestamp_lock(camera_last_timestamp_mtx);
+    if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
+      return;
+    }
+    camera_last_timestamp[cam_id0] = timestamp;
   }
-  camera_last_timestamp[cam_id0] = timestamp;
 
   // Get the image
   cv_bridge::CvImageConstPtr cv_ptr0;

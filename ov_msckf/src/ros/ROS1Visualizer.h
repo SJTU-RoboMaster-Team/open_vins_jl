@@ -195,6 +195,7 @@ protected:
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;
+  std::mutex camera_last_timestamp_mtx;
 
   // Last timestamp we visualized at
   double last_visualization_timestamp = 0;
