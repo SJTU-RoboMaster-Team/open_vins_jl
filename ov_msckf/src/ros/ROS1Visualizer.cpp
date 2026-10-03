@@ -87,8 +87,20 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   // Loop closure publishers
   pub_loop_pose = nh->advertise<nav_msgs::Odometry>("loop_pose", 2);
   pub_loop_point = nh->advertise<sensor_msgs::PointCloud>("loop_feats", 2);
-  pub_loop_extrinsic = nh->advertise<nav_msgs::Odometry>("loop_extrinsic", 2);
-  pub_loop_intrinsics = nh->advertise<sensor_msgs::CameraInfo>("loop_intrinsics", 2);
+  {
+    // Every camera publishes its own IMU->camera extrinsic and intrinsics so
+    // the pose graph can build keyframes for more than the front camera.
+    // Camera 0 keeps the historical topic names.
+    const size_t loop_cam_count = std::max<size_t>(1, _app->get_params().camera_intrinsics.size());
+    pub_loop_extrinsic.resize(loop_cam_count);
+    pub_loop_intrinsics.resize(loop_cam_count);
+    for (size_t c = 0; c < loop_cam_count; ++c) {
+      const std::string suffix = (c == 0) ? std::string() : ("_cam" + std::to_string(c));
+      pub_loop_extrinsic.at(c) = nh->advertise<nav_msgs::Odometry>("loop_extrinsic" + suffix, 2);
+      pub_loop_intrinsics.at(c) = nh->advertise<sensor_msgs::CameraInfo>("loop_intrinsics" + suffix, 2);
+      PRINT_DEBUG("Publishing: %s\n", pub_loop_intrinsics.at(c).getTopic().c_str());
+    }
+  }
   it_pub_loop_img_depth = it.advertise("loop_depth", 2);
   it_pub_loop_img_depth_color = it.advertise("loop_depth_colored", 2);
 
@@ -975,7 +987,83 @@ void ROS1Visualizer::publish_groundtruth() {
   //==========================================================================
 }
 
+// Publish the IMU->camera extrinsic and intrinsics of every camera so the
+// pose graph can start. This deliberately runs ahead of the active-track
+// gates in publish_loopclosure_information(): on a stationary start every
+// camera frame takes the ZUPT branch of VioManager::track_image_and_update
+// and returns before do_feature_propagate_update(), so active_tracks_time
+// stays -1 until the vehicle first moves. Behind those gates, loop_fusion
+// blocks forever in its startup calibration wait exactly when it should be
+// ready for the first takeoff. The estimator state timestamp is unusable as
+// a rate limiter here for the same reason, so this uses wall time.
+void ROS1Visualizer::publish_loop_calibration() {
+  const auto state = _app->get_state();
+  if (state->_calib_IMUtoCAM.empty() || state->_cam_intrinsics.empty())
+    return;
+
+  bool subscribed = false;
+  for (size_t c = 0; c < pub_loop_intrinsics.size(); ++c) {
+    subscribed = subscribed || pub_loop_extrinsic.at(c).getNumSubscribers() != 0 ||
+                 pub_loop_intrinsics.at(c).getNumSubscribers() != 0;
+  }
+  if (!subscribed)
+    return;
+
+  const double now = ros::Time::now().toSec();
+  if (last_loop_calibration_time >= 0.0 && now - last_loop_calibration_time < 0.2)
+    return;
+  last_loop_calibration_time = now;
+
+  std_msgs::Header header;
+  header.stamp = ros::Time(now);
+
+  const size_t num_cams = std::min(std::min(_app->get_params().camera_intrinsics.size(),
+                                            state->_calib_IMUtoCAM.size()),
+                                   state->_cam_intrinsics.size());
+  for (size_t c = 0; c < num_cams && c < pub_loop_intrinsics.size(); ++c) {
+
+    // need to flip the transform to the IMU frame
+    Eigen::Vector4d q_ItoC = state->_calib_IMUtoCAM.at(c)->quat();
+    Eigen::Vector3d p_CinI = -state->_calib_IMUtoCAM.at(c)->Rot().transpose() *
+                             state->_calib_IMUtoCAM.at(c)->pos();
+    nav_msgs::Odometry odometry_calib;
+    odometry_calib.header = header;
+    odometry_calib.header.frame_id = "imu";
+    odometry_calib.pose.pose.position.x = p_CinI(0);
+    odometry_calib.pose.pose.position.y = p_CinI(1);
+    odometry_calib.pose.pose.position.z = p_CinI(2);
+    odometry_calib.pose.pose.orientation.x = q_ItoC(0);
+    odometry_calib.pose.pose.orientation.y = q_ItoC(1);
+    odometry_calib.pose.pose.orientation.z = q_ItoC(2);
+    odometry_calib.pose.pose.orientation.w = q_ItoC(3);
+    pub_loop_extrinsic.at(c).publish(odometry_calib);
+
+    // PUBLISH CAMERA INTRINSICS
+    bool is_fisheye = (std::dynamic_pointer_cast<ov_core::CamEqui>(_app->get_params().camera_intrinsics.at(c)) != nullptr);
+    sensor_msgs::CameraInfo cameraparams;
+    cameraparams.header = header;
+    cameraparams.header.frame_id = "cam" + std::to_string(c);
+    cameraparams.width = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(c)->w());
+    cameraparams.height = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(c)->h());
+    cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
+    Eigen::VectorXd cparams = state->_cam_intrinsics.at(c)->value();
+    cameraparams.D = {cparams(4), cparams(5), cparams(6), cparams(7)};
+    cameraparams.K = {cparams(0), 0, cparams(2), 0, cparams(1), cparams(3), 0, 0, 1};
+    pub_loop_intrinsics.at(c).publish(cameraparams);
+  }
+}
+
 void ROS1Visualizer::publish_loopclosure_information() {
+
+  // Calibration must never wait for an active-track sample. On a stationary
+  // start every camera frame takes the ZUPT branch in
+  // VioManager::track_image_and_update and returns before
+  // do_feature_propagate_update(), so active_tracks_time stays -1 until the
+  // vehicle first moves. Publishing calibration here is what lets
+  // loop_fusion finish its startup wait while the vehicle is still on the
+  // ground; ROS2Visualizer publishes it ahead of the track gates for the
+  // same reason.
+  publish_loop_calibration();
 
   // Get the current tracks in this frame
   double active_tracks_time1 = -1;
@@ -1007,11 +1095,10 @@ void ROS1Visualizer::publish_loopclosure_information() {
   header.stamp = ros::Time(active_tracks_time1);
 
   //======================================================
-  // Check if we have subscribers for the pose odometry, camera intrinsics, or extrinsics
-  if (pub_loop_pose.getNumSubscribers() != 0 || pub_loop_extrinsic.getNumSubscribers() != 0 ||
-      pub_loop_intrinsics.getNumSubscribers() != 0) {
-
-    // PUBLISH HISTORICAL POSE ESTIMATE
+  // PUBLISH HISTORICAL POSE ESTIMATE
+  // Per-camera calibration is published by publish_loop_calibration() before
+  // the active-track gates above, so it is intentionally not gated here.
+  if (pub_loop_pose.getNumSubscribers() != 0) {
     nav_msgs::Odometry odometry_pose;
     odometry_pose.header = header;
     odometry_pose.header.frame_id = "global";
@@ -1023,35 +1110,6 @@ void ROS1Visualizer::publish_loopclosure_information() {
     odometry_pose.pose.pose.orientation.z = quat(2);
     odometry_pose.pose.pose.orientation.w = quat(3);
     pub_loop_pose.publish(odometry_pose);
-
-    // PUBLISH IMU TO CAMERA0 EXTRINSIC
-    // need to flip the transform to the IMU frame
-    Eigen::Vector4d q_ItoC = _app->get_state()->_calib_IMUtoCAM.at(0)->quat();
-    Eigen::Vector3d p_CinI = -_app->get_state()->_calib_IMUtoCAM.at(0)->Rot().transpose() * _app->get_state()->_calib_IMUtoCAM.at(0)->pos();
-    nav_msgs::Odometry odometry_calib;
-    odometry_calib.header = header;
-    odometry_calib.header.frame_id = "imu";
-    odometry_calib.pose.pose.position.x = p_CinI(0);
-    odometry_calib.pose.pose.position.y = p_CinI(1);
-    odometry_calib.pose.pose.position.z = p_CinI(2);
-    odometry_calib.pose.pose.orientation.x = q_ItoC(0);
-    odometry_calib.pose.pose.orientation.y = q_ItoC(1);
-    odometry_calib.pose.pose.orientation.z = q_ItoC(2);
-    odometry_calib.pose.pose.orientation.w = q_ItoC(3);
-    pub_loop_extrinsic.publish(odometry_calib);
-
-    // PUBLISH CAMERA0 INTRINSICS
-    bool is_fisheye = (std::dynamic_pointer_cast<ov_core::CamEqui>(_app->get_params().camera_intrinsics.at(0)) != nullptr);
-    sensor_msgs::CameraInfo cameraparams;
-    cameraparams.header = header;
-    cameraparams.header.frame_id = "cam0";
-    cameraparams.width = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->w());
-    cameraparams.height = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->h());
-    cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
-    Eigen::VectorXd cparams = _app->get_state()->_cam_intrinsics.at(0)->value();
-    cameraparams.D = {cparams(4), cparams(5), cparams(6), cparams(7)};
-    cameraparams.K = {cparams(0), 0, cparams(2), 0, cparams(1), cparams(3), 0, 0, 1};
-    pub_loop_intrinsics.publish(cameraparams);
   }
 
   //======================================================
@@ -1066,15 +1124,24 @@ void ROS1Visualizer::publish_loopclosure_information() {
 
       // Get this feature information
       size_t featid = feattimes.first;
-      // The 3D set contains tracks from all cameras, but loop_image is cam0.
-      // Missing cam0 observations must not become fabricated (0,0) matches.
+      const Eigen::Vector3d pFinG = feattimes.second;
+      if (!pFinG.allFinite())
+        continue;
+
+      // cam0 pixels stay real observations so the cam0 keyframe keeps using the
+      // measured uv. Landmarks only visible to the other cameras are published
+      // with a (-1,-1) placeholder; loop_fusion projects those with each
+      // camera's own model and extrinsic instead of fabricating (0,0) matches.
+      double uv_x = -1.0;
+      double uv_y = -1.0;
       const auto observation = active_tracks_uvd.find(featid);
-      if (observation == active_tracks_uvd.end())
-        continue;
-      const Eigen::Vector3d &uvd = observation->second;
-      Eigen::Vector3d pFinG = active_tracks_posinG.at(featid);
-      if (!uvd.allFinite() || uvd(2) < 0.1 || !pFinG.allFinite())
-        continue;
+      if (observation != active_tracks_uvd.end()) {
+        const Eigen::Vector3d &uvd = observation->second;
+        if (uvd.allFinite() && uvd(2) >= 0.1) {
+          uv_x = uvd(0);
+          uv_y = uvd(1);
+        }
+      }
 
       // Push back 3d point
       geometry_msgs::Point32 p;
@@ -1089,8 +1156,8 @@ void ROS1Visualizer::publish_loopclosure_information() {
       sensor_msgs::ChannelFloat32 p_2d;
       p_2d.values.push_back(0);
       p_2d.values.push_back(0);
-      p_2d.values.push_back(uvd(0));
-      p_2d.values.push_back(uvd(1));
+      p_2d.values.push_back(uv_x);
+      p_2d.values.push_back(uv_y);
       p_2d.values.push_back(featid);
       point_cloud.channels.push_back(p_2d);
     }

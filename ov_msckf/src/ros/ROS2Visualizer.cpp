@@ -92,8 +92,20 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
   // Loop closure publishers
   pub_loop_pose = node->create_publisher<nav_msgs::msg::Odometry>("loop_pose", 2);
   pub_loop_point = node->create_publisher<sensor_msgs::msg::PointCloud>("loop_feats", 2);
-  pub_loop_extrinsic = node->create_publisher<nav_msgs::msg::Odometry>("loop_extrinsic", 2);
-  pub_loop_intrinsics = node->create_publisher<sensor_msgs::msg::CameraInfo>("loop_intrinsics", 2);
+  {
+    // Every camera publishes its own IMU->camera extrinsic and intrinsics so
+    // the pose graph can build keyframes for more than the front camera.
+    // Camera 0 keeps the historical topic names.
+    const size_t loop_cam_count = std::max<size_t>(1, _app->get_params().camera_intrinsics.size());
+    pub_loop_extrinsic.resize(loop_cam_count);
+    pub_loop_intrinsics.resize(loop_cam_count);
+    for (size_t c = 0; c < loop_cam_count; ++c) {
+      const std::string suffix = (c == 0) ? std::string() : ("_cam" + std::to_string(c));
+      pub_loop_extrinsic.at(c) = node->create_publisher<nav_msgs::msg::Odometry>("loop_extrinsic" + suffix, 2);
+      pub_loop_intrinsics.at(c) = node->create_publisher<sensor_msgs::msg::CameraInfo>("loop_intrinsics" + suffix, 2);
+      PRINT_DEBUG("Publishing: %s\n", pub_loop_intrinsics.at(c)->get_topic_name());
+    }
+  }
   it_pub_loop_img_depth = it.advertise("loop_depth", 2);
   it_pub_loop_img_depth_color = it.advertise("loop_depth_colored", 2);
 
@@ -1068,33 +1080,42 @@ void ROS2Visualizer::publish_loopclosure_information() {
     std_msgs::msg::Header calibration_header;
     calibration_header.stamp = _node->now();
 
-    Eigen::Vector4d q_ItoC = _app->get_state()->_calib_IMUtoCAM.at(0)->quat();
-    Eigen::Vector3d p_CinI = -_app->get_state()->_calib_IMUtoCAM.at(0)->Rot().transpose() *
-      _app->get_state()->_calib_IMUtoCAM.at(0)->pos();
-    nav_msgs::msg::Odometry odometry_calib;
-    odometry_calib.header = calibration_header;
-    odometry_calib.header.frame_id = "imu";
-    odometry_calib.pose.pose.position.x = p_CinI(0);
-    odometry_calib.pose.pose.position.y = p_CinI(1);
-    odometry_calib.pose.pose.position.z = p_CinI(2);
-    odometry_calib.pose.pose.orientation.x = q_ItoC(0);
-    odometry_calib.pose.pose.orientation.y = q_ItoC(1);
-    odometry_calib.pose.pose.orientation.z = q_ItoC(2);
-    odometry_calib.pose.pose.orientation.w = q_ItoC(3);
-    pub_loop_extrinsic->publish(odometry_calib);
+    // PUBLISH IMU -> CAMERA EXTRINSIC AND INTRINSICS, ONE PAIR PER CAMERA
+    const size_t num_cams = std::min(std::min(_app->get_params().camera_intrinsics.size(),
+                                              _app->get_state()->_calib_IMUtoCAM.size()),
+                                     std::min(_app->get_state()->_cam_intrinsics.size(),
+                                              pub_loop_intrinsics.size()));
+    for (size_t c = 0; c < num_cams; ++c) {
 
-    bool is_fisheye = (std::dynamic_pointer_cast<ov_core::CamEqui>(
-        _app->get_params().camera_intrinsics.at(0)) != nullptr);
-    sensor_msgs::msg::CameraInfo cameraparams;
-    cameraparams.header = calibration_header;
-    cameraparams.header.frame_id = "cam0";
-    cameraparams.width = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->w());
-    cameraparams.height = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(0)->h());
-    cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
-    Eigen::VectorXd cparams = _app->get_state()->_cam_intrinsics.at(0)->value();
-    cameraparams.d = {cparams(4), cparams(5), cparams(6), cparams(7)};
-    cameraparams.k = {cparams(0), 0, cparams(2), 0, cparams(1), cparams(3), 0, 0, 1};
-    pub_loop_intrinsics->publish(cameraparams);
+      // need to flip the transform to the IMU frame
+      Eigen::Vector4d q_ItoC = _app->get_state()->_calib_IMUtoCAM.at(c)->quat();
+      Eigen::Vector3d p_CinI = -_app->get_state()->_calib_IMUtoCAM.at(c)->Rot().transpose() *
+        _app->get_state()->_calib_IMUtoCAM.at(c)->pos();
+      nav_msgs::msg::Odometry odometry_calib;
+      odometry_calib.header = calibration_header;
+      odometry_calib.header.frame_id = "imu";
+      odometry_calib.pose.pose.position.x = p_CinI(0);
+      odometry_calib.pose.pose.position.y = p_CinI(1);
+      odometry_calib.pose.pose.position.z = p_CinI(2);
+      odometry_calib.pose.pose.orientation.x = q_ItoC(0);
+      odometry_calib.pose.pose.orientation.y = q_ItoC(1);
+      odometry_calib.pose.pose.orientation.z = q_ItoC(2);
+      odometry_calib.pose.pose.orientation.w = q_ItoC(3);
+      pub_loop_extrinsic.at(c)->publish(odometry_calib);
+
+      bool is_fisheye = (std::dynamic_pointer_cast<ov_core::CamEqui>(
+          _app->get_params().camera_intrinsics.at(c)) != nullptr);
+      sensor_msgs::msg::CameraInfo cameraparams;
+      cameraparams.header = calibration_header;
+      cameraparams.header.frame_id = "cam" + std::to_string(c);
+      cameraparams.width = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(c)->w());
+      cameraparams.height = static_cast<uint32_t>(_app->get_params().camera_intrinsics.at(c)->h());
+      cameraparams.distortion_model = is_fisheye ? "equidistant" : "plumb_bob";
+      Eigen::VectorXd cparams = _app->get_state()->_cam_intrinsics.at(c)->value();
+      cameraparams.d = {cparams(4), cparams(5), cparams(6), cparams(7)};
+      cameraparams.k = {cparams(0), 0, cparams(2), 0, cparams(1), cparams(3), 0, 0, 1};
+      pub_loop_intrinsics.at(c)->publish(cameraparams);
+    }
   }
 
   const bool publish_loop_tracks = pub_loop_pose->get_subscription_count() != 0 || pub_loop_point->get_subscription_count() != 0 ||
@@ -1156,15 +1177,24 @@ void ROS2Visualizer::publish_loopclosure_information() {
 
       // Get this feature information
       size_t featid = feattimes.first;
-      // The 3D set contains tracks from all cameras, but loop_image is cam0.
-      // Missing cam0 observations must not become fabricated (0,0) matches.
+      const Eigen::Vector3d pFinG = feattimes.second;
+      if (!pFinG.allFinite())
+        continue;
+
+      // cam0 pixels stay real observations so the cam0 keyframe keeps using the
+      // measured uv. Landmarks only visible to the other cameras are published
+      // with a (-1,-1) placeholder; loop_fusion projects those with each
+      // camera's own model and extrinsic instead of fabricating (0,0) matches.
+      double uv_x = -1.0;
+      double uv_y = -1.0;
       const auto observation = active_tracks_uvd.find(featid);
-      if (observation == active_tracks_uvd.end())
-        continue;
-      const Eigen::Vector3d &uvd = observation->second;
-      Eigen::Vector3d pFinG = active_tracks_posinG.at(featid);
-      if (!uvd.allFinite() || uvd(2) < 0.1 || !pFinG.allFinite())
-        continue;
+      if (observation != active_tracks_uvd.end()) {
+        const Eigen::Vector3d &uvd = observation->second;
+        if (uvd.allFinite() && uvd(2) >= 0.1) {
+          uv_x = uvd(0);
+          uv_y = uvd(1);
+        }
+      }
 
       // Push back 3d point
       geometry_msgs::msg::Point32 p;
@@ -1179,8 +1209,8 @@ void ROS2Visualizer::publish_loopclosure_information() {
       sensor_msgs::msg::ChannelFloat32 p_2d;
       p_2d.values.push_back(0);
       p_2d.values.push_back(0);
-      p_2d.values.push_back(uvd(0));
-      p_2d.values.push_back(uvd(1));
+      p_2d.values.push_back(uv_x);
+      p_2d.values.push_back(uv_y);
       p_2d.values.push_back(featid);
       point_cloud.channels.push_back(p_2d);
     }

@@ -168,9 +168,12 @@ protected:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odomimu;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_pathimu;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_points_msckf, pub_points_slam, pub_points_aruco, pub_points_sim;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_loop_pose, pub_loop_extrinsic;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_loop_pose;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr pub_loop_point;
-  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_loop_intrinsics;
+  // One calibration publisher per camera. Camera 0 keeps the historical
+  // `loop_extrinsic`/`loop_intrinsics` topic names; camera N uses `_camN`.
+  std::vector<rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr> pub_loop_extrinsic;
+  std::vector<rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr> pub_loop_intrinsics;
   std::shared_ptr<tf2_ros::TransformBroadcaster> mTfBr;
 
   // Our subscribers and camera synchronizers

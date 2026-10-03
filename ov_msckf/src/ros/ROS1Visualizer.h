@@ -132,6 +132,10 @@ protected:
   /// Publish loop-closure information of current pose and active track information
   void publish_loopclosure_information();
 
+  /// Publish per-camera loop calibration independently of the active tracks.
+  /// See the definition for why it must not sit behind the track gates.
+  void publish_loop_calibration();
+
   /// Global node handler
   std::shared_ptr<ros::NodeHandle> _nh;
 
@@ -145,8 +149,12 @@ protected:
   image_transport::Publisher it_pub_tracks, it_pub_loop_img_depth, it_pub_loop_img_depth_color;
   ros::Publisher pub_poseimu, pub_odomimu, pub_pathimu;
   ros::Publisher pub_points_msckf, pub_points_slam, pub_points_aruco, pub_points_sim;
-  ros::Publisher pub_loop_pose, pub_loop_point, pub_loop_extrinsic, pub_loop_intrinsics;
+  ros::Publisher pub_loop_pose, pub_loop_point;
+  // One calibration publisher per camera. Camera 0 keeps the historical
+  // `loop_extrinsic`/`loop_intrinsics` topic names; camera N uses `_camN`.
+  std::vector<ros::Publisher> pub_loop_extrinsic, pub_loop_intrinsics;
   double last_loopclosure_publish_time = -1.0;
+  double last_loop_calibration_time = -1.0;
   std::shared_ptr<tf::TransformBroadcaster> mTfBr;
 
   // Our subscribers and camera synchronizers
