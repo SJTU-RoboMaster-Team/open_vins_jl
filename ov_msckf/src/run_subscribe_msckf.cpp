@@ -105,6 +105,8 @@ int main(int argc, char **argv) {
   ros::AsyncSpinner spinner(0);
   spinner.start();
   ros::waitForShutdown();
+  // No callback may submit a new worker while final visualization joins them.
+  spinner.stop();
 #elif ROS_AVAILABLE == 2
   // rclcpp::spin(node);
   rclcpp::executors::MultiThreadedExecutor executor;
@@ -115,6 +117,10 @@ int main(int argc, char **argv) {
   // Final visualization
   viz->visualize_final();
 #if ROS_AVAILABLE == 1
+  // These owners are globals; release ROS publishers/handles before ROS's
+  // process-wide managers begin static destruction after main returns.
+  viz.reset();
+  sys.reset();
   ros::shutdown();
 #elif ROS_AVAILABLE == 2
   rclcpp::shutdown();

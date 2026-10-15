@@ -42,9 +42,12 @@
 #include <tf/transform_broadcaster.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include <Eigen/Eigen>
 #include <boost/date_time/posix_time/posix_time.hpp>
@@ -83,6 +86,7 @@ public:
    * @param sim Simulator if we are simulating
    */
   ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim = nullptr);
+  ~ROS1Visualizer();
 
   /**
    * @brief Will setup ROS subscribers and callbacks
@@ -132,9 +136,33 @@ protected:
   /// Publish loop-closure information of current pose and active track information
   void publish_loopclosure_information();
 
+  /// Wall-clock performance diagnostics; these only observe existing callbacks.
+  struct TimingStats {
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> max_ns{0};
+  };
+  struct PhaseSnapshot {
+    uint64_t steady_ns{0};
+    uint64_t cpu_ns{0};
+    long minor_faults{0};
+    long major_faults{0};
+    long voluntary_switches{0};
+    long involuntary_switches{0};
+  };
+  static uint64_t steady_now_ns();
+  static void update_timing_max(std::atomic<uint64_t> &target, uint64_t value);
+  static PhaseSnapshot phase_snapshot();
+  void record_timing(TimingStats &stats, const char *phase, const PhaseSnapshot &start,
+                     double sensor_stamp);
+  void report_timing_diagnostics(const ros::WallTimerEvent &event);
+
   /// Publish per-camera loop calibration independently of the active tracks.
   /// See the definition for why it must not sit behind the track gates.
   void publish_loop_calibration();
+
+  /// Caller must quiesce external ROS callbacks before destroying this object.
+  /// Joins never run while holding estimator state or camera queue locks.
+  void stop_workers();
 
   /// Global node handler
   std::shared_ptr<ros::NodeHandle> _nh;
@@ -182,6 +210,24 @@ protected:
 
   // Thread atomics
   std::atomic<bool> thread_update_running;
+  std::atomic<bool> stopping_{false};
+  std::mutex worker_ownership_mtx_;
+  std::thread image_thread_, update_thread_;
+  bool workers_stopped_ = false;
+  ros::WallTimer timing_diagnostics_timer_;
+  std::atomic<uint64_t> imu_callback_count_{0};
+  std::atomic<uint64_t> imu_last_receipt_ns_{0};
+  std::atomic<uint64_t> imu_max_receipt_gap_ns_{0};
+  TimingStats imu_feed_timing_;
+  TimingStats imu_visualize_timing_;
+  TimingStats camera_feed_timing_;
+  TimingStats camera_visualize_timing_;
+  TimingStats camera_queue_lock_timing_;
+  TimingStats imu_state_lock_wait_timing_;
+  TimingStats camera_state_lock_wait_timing_;
+  TimingStats image_state_lock_wait_timing_;
+  std::atomic<uint64_t> invalid_fast_odom_count_{0};
+  uint64_t invalid_fast_odom_last_report_ns_{0};
 
   // Optional T265 vibration pre-filter. Disabled by default; experiments
   // enable it through private ROS parameters without changing the estimator
@@ -208,6 +254,10 @@ protected:
   // Last timestamp we visualized at
   double last_visualization_timestamp = 0;
   double last_visualization_timestamp_image = 0;
+
+  // TF shares the fast odometry sensor stamp; duplicate IMU samples must not
+  // broadcast an already published transform again.
+  double last_odometry_tf_timestamp = 0;
 
   // Our groundtruth states
   std::map<double, Eigen::Matrix<double, 17, 1>> gt_states;

@@ -25,11 +25,14 @@
 #include <Eigen/StdVector>
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <cstddef>
 #include <boost/filesystem.hpp>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "VioManagerOptions.h"
 
@@ -45,6 +48,7 @@ class InertialInitializer;
 
 namespace ov_msckf {
 
+class BoundedStatsLogger;
 class State;
 class StateHelper;
 class UpdaterMSCKF;
@@ -67,6 +71,18 @@ public:
    * @param params_ Parameters loaded from either ROS or CMDLINE
    */
   VioManager(VioManagerOptions &params_);
+
+  ~VioManager();
+
+  struct StatsLogDiagnostics { uint64_t written = 0, dropped = 0, truncated = 0, queued = 0; };
+  StatsLogDiagnostics stats_log_diagnostics() const;
+
+  /// Best-effort INFO record: fixed-copy enqueue only, safe under estimator locks.
+  bool enqueue_info_diagnostic(const char *data, std::size_t size);
+
+  /// Shutdown barrier: stop submitting measurements first; never hold the state
+  /// mutex while waiting, since the initializer may need it to finish.
+  void wait_for_initialization();
 
   /**
    * @brief Feed function for inertial data
@@ -112,6 +128,11 @@ public:
 
   /// Accessor to get the current state
   std::shared_ptr<State> get_state() { return state; }
+
+  /// ROS adapters must hold this across estimator reads/updates and fast
+  /// propagation. The asynchronous initializer uses the same lock. In the
+  /// synchronous initializer mode its joining caller already owns the lock.
+  std::mutex &get_state_mutex() { return estimator_state_mtx; }
 
   /// Accessor to get the current propagator
   std::shared_ptr<Propagator> get_propagator() { return propagator; }
@@ -203,6 +224,9 @@ protected:
   /// Boolean if we are initialized or not
   bool is_initialized_vio = false;
 
+  /// Shared with the ROS1 adapter and asynchronous initialization worker.
+  std::mutex estimator_state_mtx;
+
   /// Our MSCKF feature updater
   std::shared_ptr<UpdaterMSCKF> updaterMSCKF;
 
@@ -218,6 +242,7 @@ protected:
   std::mutex camera_queue_init_mtx;
 
   // Timing statistic file and variables
+  std::unique_ptr<BoundedStatsLogger> stats_logger_;
   std::ofstream of_statistics;
   boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 
@@ -230,6 +255,7 @@ protected:
 
   // Threads and their atomics
   std::atomic<bool> thread_init_running, thread_init_success;
+  std::thread initialization_thread_;
 
   // If we did a zero velocity update
   bool did_zupt_update = false;

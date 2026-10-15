@@ -23,6 +23,8 @@
 #define OV_MSCKF_STATE_PROPAGATOR_H
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
@@ -33,6 +35,16 @@
 namespace ov_msckf {
 
 class State;
+
+struct ImuSelectionDiagnostics {
+  bool no_input{false};
+  bool no_interval{false};
+  bool insufficient{false};
+  bool missing_end{false};
+  size_t selected_count{0};
+  size_t zero_dt_removed_count{0};
+  double missing_end_s{0.0};
+};
 
 /**
  * @brief Performs the state covariance and mean propagation using imu measurements
@@ -139,7 +151,8 @@ public:
    * @return Vector of measurements (if we could compute them)
    */
   static std::vector<ov_core::ImuData> select_imu_readings(const std::vector<ov_core::ImuData> &imu_data, double time0, double time1,
-                                                           bool warn = true);
+                                                           bool warn = true,
+                                                           ImuSelectionDiagnostics *diagnostics = nullptr);
 
   /**
    * @brief Nice helper function that will linearly interpolate between two imu messages.

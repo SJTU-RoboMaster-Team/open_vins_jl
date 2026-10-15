@@ -132,6 +132,35 @@ if (catkin_FOUND AND ENABLE_ROS)
             DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
     )
 
+    if(CATKIN_ENABLE_TESTING)
+        catkin_add_gtest(test_propagator_log_nonblocking test/test_propagator_log_nonblocking.cpp)
+        if(TARGET test_propagator_log_nonblocking)
+            target_link_libraries(test_propagator_log_nonblocking
+                    ov_msckf_lib ${thirdparty_libraries} gtest_main)
+        endif()
+
+        catkin_add_gtest(test_initialization_camera_times test/test_initialization_camera_times.cpp)
+        if(TARGET test_initialization_camera_times)
+            target_link_libraries(test_initialization_camera_times gtest_main)
+        endif()
+
+        catkin_add_gtest(test_zupt_stationary_evidence test/test_zupt_stationary_evidence.cpp)
+        if(TARGET test_zupt_stationary_evidence)
+            target_link_libraries(test_zupt_stationary_evidence gtest_main)
+        endif()
+
+        catkin_add_gtest(test_zupt_stationary_integration test/test_zupt_stationary_integration.cpp)
+        if(TARGET test_zupt_stationary_integration)
+            target_link_libraries(test_zupt_stationary_integration
+                    ov_msckf_lib ${thirdparty_libraries} gtest_main)
+        endif()
+
+        catkin_add_gtest(test_bounded_stats_logger test/test_bounded_stats_logger.cpp)
+        if(TARGET test_bounded_stats_logger)
+            target_link_libraries(test_bounded_stats_logger gtest_main)
+        endif()
+    endif()
+
 endif ()
 
 add_executable(run_simulation src/run_simulation.cpp)

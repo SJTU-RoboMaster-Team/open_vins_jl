@@ -26,9 +26,55 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
+#include <chrono>
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+
+void report_imu_selection_diagnostics(const ov_msckf::ImuSelectionDiagnostics &diagnostics) {
+  using SteadyClock = std::chrono::steady_clock;
+  static std::atomic<uint64_t> total_zero_dt_removed{0};
+  static std::atomic<uint64_t> last_zero_dt_report_ns{0};
+
+  if (diagnostics.no_input) {
+    PRINT_WARNING(YELLOW "Propagator::select_imu_readings(): No IMU measurements. IMU-CAMERA are likely messed up!!!\n" RESET);
+  } else if (diagnostics.no_interval) {
+    PRINT_WARNING(YELLOW
+                  "Propagator::select_imu_readings(): No IMU measurements to propagate with (0 of 2). IMU-CAMERA are likely messed up!!!\n" RESET);
+  }
+  if (diagnostics.missing_end) {
+    PRINT_DEBUG(YELLOW "Propagator::select_imu_readings(): Missing inertial measurements to propagate with (%f sec missing)!\n" RESET,
+                diagnostics.missing_end_s);
+  }
+  if (diagnostics.insufficient) {
+    PRINT_WARNING(YELLOW
+                  "Propagator::select_imu_readings(): No IMU measurements to propagate with (%d of 2). IMU-CAMERA are likely messed up!!!\n" RESET,
+                  static_cast<int>(diagnostics.selected_count));
+  }
+
+  if (diagnostics.zero_dt_removed_count == 0) {
+    return;
+  }
+  const uint64_t total = total_zero_dt_removed.fetch_add(diagnostics.zero_dt_removed_count,
+                                                         std::memory_order_relaxed) +
+                         diagnostics.zero_dt_removed_count;
+  const uint64_t now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      SteadyClock::now().time_since_epoch()).count());
+  uint64_t previous_ns = last_zero_dt_report_ns.load(std::memory_order_relaxed);
+  if (previous_ns == 0 || now_ns - previous_ns >= 5000000000ULL) {
+    if (last_zero_dt_report_ns.compare_exchange_strong(previous_ns, now_ns,
+                                                       std::memory_order_relaxed)) {
+      PRINT_WARNING(YELLOW
+                    "Propagator::select_imu_readings(): Removed %zu zero-DT IMU samples in this update; cumulative removed=%llu\n" RESET,
+                    diagnostics.zero_dt_removed_count, static_cast<unsigned long long>(total));
+    }
+  }
+}
+
+} // namespace
 
 void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
 
@@ -63,10 +109,13 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   double time0 = state->_timestamp + last_prop_time_offset;
   double time1 = timestamp + t_off_new;
   std::vector<ov_core::ImuData> prop_data;
+  ImuSelectionDiagnostics selection_diagnostics;
   {
     std::lock_guard<std::mutex> lck(imu_data_mtx);
-    prop_data = Propagator::select_imu_readings(imu_data, time0, time1);
+    prop_data = Propagator::select_imu_readings(imu_data, time0, time1, false,
+                                                &selection_diagnostics);
   }
+  report_imu_selection_diagnostics(selection_diagnostics);
 
   // We are going to sum up all the state transition matrices, so we can do a single large multiplication at the end
   // Phi_summed = Phi_i*Phi_summed
@@ -287,13 +336,19 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
 }
 
 std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<ov_core::ImuData> &imu_data, double time0, double time1,
-                                                              bool warn) {
+                                                              bool warn, ImuSelectionDiagnostics *diagnostics) {
+
+  if (diagnostics != nullptr) {
+    *diagnostics = ImuSelectionDiagnostics{};
+  }
 
   // Our vector imu readings
   std::vector<ov_core::ImuData> prop_data;
 
   // Ensure we have some measurements in the first place!
   if (imu_data.empty()) {
+    if (diagnostics != nullptr)
+      diagnostics->no_input = true;
     if (warn)
       PRINT_WARNING(YELLOW "Propagator::select_imu_readings(): No IMU measurements. IMU-CAMERA are likely messed up!!!\n" RESET);
     return prop_data;
@@ -363,6 +418,8 @@ std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<
 
   // Check that we have at least one measurement to propagate with
   if (prop_data.empty()) {
+    if (diagnostics != nullptr)
+      diagnostics->no_interval = true;
     if (warn)
       PRINT_WARNING(
           YELLOW
@@ -376,6 +433,10 @@ std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<
   // Then we should just "stretch" the last measurement to be the whole period
   // TODO: this really isn't that good of logic, we should fix this so the above logic is exact!
   if (prop_data.at(prop_data.size() - 1).timestamp != time1) {
+    if (diagnostics != nullptr) {
+      diagnostics->missing_end = true;
+      diagnostics->missing_end_s = time1 - imu_data.at(imu_data.size() - 1).timestamp;
+    }
     if (warn)
       PRINT_DEBUG(YELLOW "Propagator::select_imu_readings(): Missing inertial measurements to propagate with (%f sec missing)!\n" RESET,
                   (time1 - imu_data.at(imu_data.size() - 1).timestamp));
@@ -390,6 +451,8 @@ std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<
   // TODO: we should actually fix this by properly implementing this function and doing unit tests on it...
   for (size_t i = 0; i < prop_data.size() - 1; i++) {
     if (std::abs(prop_data.at(i + 1).timestamp - prop_data.at(i).timestamp) < 1e-12) {
+      if (diagnostics != nullptr)
+        ++diagnostics->zero_dt_removed_count;
       if (warn)
         PRINT_WARNING(YELLOW "Propagator::select_imu_readings(): Zero DT between IMU reading %d and %d, removing it!\n" RESET, (int)i,
                       (int)(i + 1));
@@ -400,6 +463,10 @@ std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<
 
   // Check that we have at least one measurement to propagate with
   if (prop_data.size() < 2) {
+    if (diagnostics != nullptr) {
+      diagnostics->insufficient = true;
+      diagnostics->selected_count = prop_data.size();
+    }
     if (warn)
       PRINT_WARNING(
           YELLOW

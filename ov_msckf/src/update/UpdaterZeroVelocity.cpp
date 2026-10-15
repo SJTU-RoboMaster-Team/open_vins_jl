@@ -22,6 +22,7 @@
 #include "UpdaterZeroVelocity.h"
 
 #include "UpdaterHelper.h"
+#include "zupt_stationary_evidence.h"
 
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureHelper.h"
@@ -34,6 +35,7 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <stdexcept>
 
 using namespace ov_core;
 using namespace ov_type;
@@ -41,9 +43,20 @@ using namespace ov_msckf;
 
 UpdaterZeroVelocity::UpdaterZeroVelocity(UpdaterOptions &options, NoiseManager &noises, std::shared_ptr<ov_core::FeatureDatabase> db,
                                          std::shared_ptr<Propagator> prop, double gravity_mag, double zupt_max_velocity,
-                                         double zupt_noise_multiplier, double zupt_max_disparity)
+                                         double zupt_noise_multiplier, double zupt_max_disparity,
+                                         bool require_visual_stationary)
     : _options(options), _noises(noises), _db(db), _prop(prop), _zupt_max_velocity(zupt_max_velocity),
-      _zupt_noise_multiplier(zupt_noise_multiplier), _zupt_max_disparity(zupt_max_disparity) {
+      _zupt_noise_multiplier(zupt_noise_multiplier), _zupt_max_disparity(zupt_max_disparity),
+      _require_visual_stationary(require_visual_stationary) {
+
+  if (_require_visual_stationary &&
+      (!std::isfinite(_zupt_max_disparity) || _zupt_max_disparity <= 0.0 ||
+       !std::isfinite(_zupt_max_velocity) || _zupt_max_velocity <= 0.0)) {
+    throw std::invalid_argument("visual-stationary ZUPT requires positive finite disparity and velocity limits");
+  }
+  PRINT_INFO("[ZUPT]: policy=%s max_disparity_px=%.6f min_visual_matches=21 max_velocity_mps=%.6f\n",
+             _require_visual_stationary ? "visual_and_inertial" : "legacy_visual_override_or_inertial",
+             _zupt_max_disparity, _zupt_max_velocity);
 
   // Gravity
   _gravity << 0.0, 0.0, gravity_mag;
@@ -217,14 +230,14 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
 
   // Check if the image disparity
   bool disparity_passed = false;
+  int num_features = 0;
+  double disp_avg = 0.0;
+  double disp_var = 0.0;
   if (override_with_disparity_check) {
 
     // Get the disparity statistics from this image to the previous
     double time0_cam = state->_timestamp;
     double time1_cam = timestamp;
-    int num_features = 0;
-    double disp_avg = 0.0;
-    double disp_var = 0.0;
     FeatureHelper::compute_disparity(_db, time0_cam, time1_cam, disp_avg, disp_var, num_features);
 
     // Check if this disparity is enough to be classified as moving
@@ -238,15 +251,33 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
 
   // Check if we are currently zero velocity
   // We need to pass the chi2 and not be above our velocity threshold
-  if (!disparity_passed && (chi2 > _options.chi2_multipler * chi2_check || state->_imu->vel().norm() > _zupt_max_velocity)) {
+  const double speed = state->_imu->vel().norm();
+  const double chi2_limit = _options.chi2_multipler * chi2_check;
+  // At nearly constant velocity, IMU stationarity alone can accept an update
+  // that freezes real image motion. The opt-in policy requires both sensors;
+  // missing or invalid visual evidence falls back to the normal VIO update.
+  const auto evidence = evaluate_stationary_evidence(disp_avg, num_features, _zupt_max_disparity,
+                                                     chi2, chi2_limit, speed, _zupt_max_velocity);
+  const bool rejected = _require_visual_stationary
+                            ? !evidence.accepted
+                            : (!disparity_passed && (chi2 > chi2_limit || speed > _zupt_max_velocity));
+  if (rejected) {
     last_zupt_state_timestamp = 0.0;
     last_zupt_count = 0;
+    if (_require_visual_stationary) {
+      PRINT_INFO(YELLOW "[ZUPT]: rejected sensor_stamp_s=%.9f policy=visual_and_inertial visual_stationary=%d "
+                        "inertial_stationary=%d disparity_px=%.6f matches=%d limit_px=%.6f speed_mps=%.6f "
+                        "chi2=%.6f chi2_limit=%.6f\n" RESET,
+                 timestamp, evidence.visual_stationary, evidence.inertial_stationary, disp_avg,
+                 num_features, _zupt_max_disparity, speed, chi2, chi2_limit);
+    }
     PRINT_DEBUG(YELLOW "[ZUPT]: rejected |v_IinG| = %.3f (chi2 %.3f > %.3f)\n" RESET, state->_imu->vel().norm(), chi2,
                 _options.chi2_multipler * chi2_check);
     return false;
   }
-  PRINT_INFO(CYAN "[ZUPT]: accepted |v_IinG| = %.3f (chi2 %.3f < %.3f)\n" RESET, state->_imu->vel().norm(), chi2,
-             _options.chi2_multipler * chi2_check);
+  PRINT_INFO(CYAN "[ZUPT]: accepted |v_IinG| = %.3f (chi2 %.3f < %.3f) sensor_stamp_s=%.9f "
+                  "disparity_px=%.6f matches=%d require_visual=%d\n" RESET,
+             speed, chi2, chi2_limit, timestamp, disp_avg, num_features, _require_visual_stationary);
 
   // Do our update, only do this update if we have previously detected
   // If we have succeeded, then we should remove the current timestamp feature tracks

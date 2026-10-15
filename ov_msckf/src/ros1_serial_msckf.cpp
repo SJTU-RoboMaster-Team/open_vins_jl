@@ -276,6 +276,9 @@ int main(int argc, char **argv) {
 
   // Final visualization
   viz->visualize_final();
+  viz.reset();
+  sys.reset();
+  ros::shutdown();
 
   // Done!
   return EXIT_SUCCESS;

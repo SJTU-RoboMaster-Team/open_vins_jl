@@ -20,6 +20,8 @@
  */
 
 #include "VioManager.h"
+#include "bounded_stats_logger.h"
+#include "initialization_camera_times.h"
 
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
@@ -36,6 +38,17 @@
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+VioManager::~VioManager() {
+  wait_for_initialization();
+  // The adapter has already quiesced all feeds. Never join under the state lock.
+  if (stats_logger_) stats_logger_->stop();
+}
+
+void VioManager::wait_for_initialization() {
+  if (initialization_thread_.joinable())
+    initialization_thread_.join();
+}
 
 void VioManager::initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate) {
 
@@ -92,8 +105,17 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
   }
 
   // Run the initialization in a second thread so it can go as slow as it desires
+  // A prior failed attempt may have finished but still needs to be reaped.
+  // In asynchronous mode its state lock has been released before this caller
+  // can enter with thread_init_running == false.
+  wait_for_initialization();
   thread_init_running = true;
-  std::thread thread([&] {
+  auto initialize_task = [this] {
+    // A synchronous caller joins this worker while owning the state lock;
+    // only the asynchronous initializer needs to acquire it independently.
+    std::unique_lock<std::mutex> state_lock(estimator_state_mtx, std::defer_lock);
+    if (params.use_multi_threading_subs)
+      state_lock.lock();
     // Returns from our initializer
     double timestamp;
     Eigen::MatrixXd covariance;
@@ -143,15 +165,13 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
                  state->_imu->bias_a()(2));
       PRINT_INFO(GREEN "[init]: position = %.4f, %.4f, %.4f\n" RESET, state->_imu->pos()(0), state->_imu->pos()(1), state->_imu->pos()(2));
 
-      // Remove any camera times that are order then the initialized time
-      // This can happen if the initialization has taken a while to perform
+      // Cameras can enqueue the same pose timestamp independently while the
+      // initializer runs. Catch up once per distinct time: repeated times would
+      // violate the propagator's one-clone-per-timestamp invariant.
       std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
-      std::vector<double> camera_timestamps_to_init;
-      for (size_t i = 0; i < camera_queue_init.size(); i++) {
-        if (camera_queue_init.at(i) > timestamp) {
-          camera_timestamps_to_init.push_back(camera_queue_init.at(i));
-        }
-      }
+      const auto camera_timestamps_to_init = independent_camera_times(camera_queue_init, timestamp);
+      PRINT_INFO("[init]: catch-up queued=%zu independent_future_times=%zu initialized_stamp=%.9f\n",
+                 camera_queue_init.size(), camera_timestamps_to_init.size(), timestamp);
 
       // Now we have initialized we will propagate the state to the current timestep
       // In general this should be ok as long as the initialization didn't take too long to perform
@@ -175,14 +195,18 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
 
     // Finally, mark that the thread has finished running
     thread_init_running = false;
-  });
+  };
+  try {
+    initialization_thread_ = std::thread(initialize_task);
+  } catch (...) {
+    thread_init_running = false;
+    throw;
+  }
 
   // If we are single threaded, then run single threaded
-  // Otherwise detach this thread so it runs in the background!
+  // Otherwise retain ownership until the next attempt or shutdown barrier.
   if (!params.use_multi_threading_subs) {
-    thread.join();
-  } else {
-    thread.detach();
+    initialization_thread_.join();
   }
   return false;
 }
