@@ -1,13 +1,13 @@
 cmake_minimum_required(VERSION 3.3)
 
 # Find ROS build system
-find_package(catkin QUIET COMPONENTS roscpp rosbag tf std_msgs geometry_msgs sensor_msgs nav_msgs visualization_msgs image_transport cv_bridge ov_core ov_init)
+find_package(catkin QUIET COMPONENTS roscpp rosbag tf std_msgs diagnostic_msgs geometry_msgs sensor_msgs nav_msgs visualization_msgs image_transport cv_bridge ov_core ov_init)
 
 # Describe ROS project
 if (catkin_FOUND AND ENABLE_ROS)
     add_definitions(-DROS_AVAILABLE=1)
     catkin_package(
-            CATKIN_DEPENDS roscpp rosbag tf std_msgs geometry_msgs sensor_msgs nav_msgs visualization_msgs image_transport cv_bridge ov_core ov_init
+            CATKIN_DEPENDS roscpp rosbag tf std_msgs diagnostic_msgs geometry_msgs sensor_msgs nav_msgs visualization_msgs image_transport cv_bridge ov_core ov_init
             INCLUDE_DIRS src/
             LIBRARIES ov_msckf_lib
     )
@@ -133,6 +133,11 @@ if (catkin_FOUND AND ENABLE_ROS)
     )
 
     if(CATKIN_ENABLE_TESTING)
+        catkin_add_gtest(test_camera_backlog test/test_camera_backlog.cpp)
+        if(TARGET test_camera_backlog)
+            target_link_libraries(test_camera_backlog gtest_main)
+        endif()
+
         catkin_add_gtest(test_propagator_log_nonblocking test/test_propagator_log_nonblocking.cpp)
         if(TARGET test_propagator_log_nonblocking)
             target_link_libraries(test_propagator_log_nonblocking

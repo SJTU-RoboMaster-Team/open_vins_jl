@@ -380,6 +380,8 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
 }
 
 void VioManager::track_image_and_update(const ov_core::CameraData &message_const) {
+  update_diagnostics_.msckf_gated_last = 0;
+  update_diagnostics_.slam_gated_last = 0;
 
   // Start timing
   rT1 = boost::posix_time::microsec_clock::local_time();
@@ -429,6 +431,10 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     // If the same state time, use the previous timestep decision
     if (state->_timestamp != message.timestamp) {
       did_zupt_update = updaterZUPT->try_update(state, message.timestamp);
+      if (did_zupt_update) {
+        ++update_diagnostics_.zupt_accepted;
+        update_diagnostics_.last_zupt_stamp = message.timestamp;
+      }
     }
     if (did_zupt_update) {
       assert(state->_timestamp == message.timestamp);
@@ -671,6 +677,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
   updaterMSCKF->update(state, featsup_MSCKF);
+  update_diagnostics_.msckf_gated_last = featsup_MSCKF.size();
+  update_diagnostics_.msckf_gated_total += featsup_MSCKF.size();
+  if (!featsup_MSCKF.empty()) update_diagnostics_.last_msckf_stamp = message.timestamp;
   propagator->invalidate_cache();
   rT4 = boost::posix_time::microsec_clock::local_time();
   msckf_phase.finish();
@@ -693,6 +702,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     propagator->invalidate_cache();
   }
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
+  update_diagnostics_.slam_gated_last = feats_slam_UPDATE.size();
+  update_diagnostics_.slam_gated_total += feats_slam_UPDATE.size();
+  if (!feats_slam_UPDATE.empty()) update_diagnostics_.last_slam_stamp = message.timestamp;
   rT5 = boost::posix_time::microsec_clock::local_time();
   slam_phase.finish();
   SlowPhaseTimer delayed_init_phase("estimator_slam_delayed_init", message.timestamp);

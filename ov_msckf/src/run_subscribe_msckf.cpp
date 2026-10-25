@@ -102,7 +102,15 @@ int main(int argc, char **argv) {
   PRINT_DEBUG("done...spinning to ros\n");
 #if ROS_AVAILABLE == 1
   // ros::spin();
-  ros::AsyncSpinner spinner(0);
+  // Four short ingress callbacks are sufficient; avoid one spinner per host
+  // logical CPU contending on the same estimator mutex on small flight boards.
+  int spinner_threads = 4;
+  nh->param<int>("ros_spinner_threads", spinner_threads, 4);
+  if (spinner_threads < 1 || spinner_threads > 64) {
+    PRINT_ERROR("ros_spinner_threads must be between 1 and 64\n");
+    return EXIT_FAILURE;
+  }
+  ros::AsyncSpinner spinner(spinner_threads);
   spinner.start();
   ros::waitForShutdown();
   // No callback may submit a new worker while final visualization joins them.

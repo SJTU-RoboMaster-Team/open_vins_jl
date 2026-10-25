@@ -31,9 +31,12 @@
 #include "utils/print.h"
 #include "utils/sensor_data.h"
 #include "utils/camera_sync.h"
+#include "utils/camera_backlog.h"
 
 #include <cmath>
 #include <cstdio>
+#include <iomanip>
+#include <sstream>
 #include <sys/resource.h>
 #include <time.h>
 
@@ -42,7 +45,23 @@ using namespace ov_type;
 using namespace ov_msckf;
 
 ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim)
-    : _nh(nh), _app(app), _sim(sim), thread_update_running(false) {
+    : _nh(nh), _app(app), _sim(sim) {
+
+  const auto options = _app->get_params();
+  async_subs_ = options.use_multi_threading_subs;
+  async_pubs_ = options.use_multi_threading_pubs;
+  expected_cameras_ = options.state_options.num_cameras;
+  camera_min_interval_s_ = 1.0 / options.track_frequency;
+  if (options.use_mask)
+    camera_masks_ = options.masks;
+  nh->param<int>("camera_queue_max_messages", camera_queue_max_messages_, std::max<int>(16, 4 * expected_cameras_));
+  nh->param<double>("camera_queue_max_span_s", camera_queue_max_span_s_, 0.15);
+  nh->param<int>("camera_subscriber_queue_size", camera_subscriber_queue_size_, 2);
+  if (camera_subscriber_queue_size_ < 1 || camera_subscriber_queue_size_ > 100)
+    throw std::invalid_argument("camera_subscriber_queue_size must be in [1, 100]");
+  if (camera_queue_max_messages_ < static_cast<int>(expected_cameras_) ||
+      !std::isfinite(camera_queue_max_span_s_) || camera_queue_max_span_s_ <= 0)
+    throw std::invalid_argument("camera queue limits must hold one group and have a finite positive span");
 
   // Setup our transform broadcaster
   mTfBr = std::make_shared<tf::TransformBroadcaster>();
@@ -55,6 +74,9 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   if (camera_sync_tolerance_s_ > 0.0) {
     PRINT_INFO("Near-synchronous camera bundling enabled (tolerance %.3f s)\n", camera_sync_tolerance_s_);
   }
+
+  PRINT_INFO("ROS1 camera transport: max_messages=%d max_span_s=%.3f subscriber_queue=%d persistent_worker=%d\n",
+             camera_queue_max_messages_, camera_queue_max_span_s_, camera_subscriber_queue_size_, static_cast<int>(async_subs_));
 
   // Create image transport
   image_transport::ImageTransport it(*_nh);
@@ -193,11 +215,11 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   }
 
   // Start thread for the image publishing
-  if (_app->get_params().use_multi_threading_pubs) {
+  if (async_pubs_) {
     image_thread_ = std::thread([this] {
       ros::WallRate loop_rate(20);
       while (!stopping_.load() && ros::ok()) {
-        {
+        if (it_pub_tracks.getNumSubscribers() != 0) {
           const PhaseSnapshot lock_start = phase_snapshot();
           std::lock_guard<std::mutex> state_lock(_app->get_state_mutex());
           record_timing(image_state_lock_wait_timing_, "image_state_lock_wait", lock_start,
@@ -209,6 +231,29 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
     });
   }
 
+  // One owned worker replaces construction/join of a thread on every IMU.
+  // Wake on ingress, never poll or retain a callback's stack measurement.
+  if (async_subs_) {
+    update_thread_ = std::thread([this] {
+      uint64_t handled = 0;
+      while (!stopping_.load()) {
+        {
+          std::unique_lock<std::mutex> lock(camera_queue_mtx);
+          camera_queue_cv_.wait(lock, [this, &handled] {
+            return stopping_.load() || camera_queue_generation_ != handled;
+          });
+          if (stopping_.load())
+            return;
+          handled = camera_queue_generation_;
+        }
+        process_camera_queue();
+      }
+    });
+  }
+
+  pub_recording_diagnostics_ = nh->advertise<diagnostic_msgs::DiagnosticArray>("diagnostics", 1);
+  recording_diagnostics_timer_ = nh->createWallTimer(
+      ros::WallDuration(0.5), &ROS1Visualizer::publish_recording_diagnostics, this);
   timing_diagnostics_timer_ = nh->createWallTimer(
       ros::WallDuration(5.0), &ROS1Visualizer::report_timing_diagnostics, this);
 }
@@ -219,11 +264,16 @@ ROS1Visualizer::~ROS1Visualizer() {
 }
 
 void ROS1Visualizer::stop_workers() {
-  stopping_.store(true);
   std::lock_guard<std::mutex> ownership_lock(worker_ownership_mtx_);
   if (workers_stopped_)
     return;
+  {
+    std::lock_guard<std::mutex> queue_lock(camera_queue_mtx);
+    stopping_.store(true);
+  }
+  camera_queue_cv_.notify_all();
   timing_diagnostics_timer_.stop();
+  recording_diagnostics_timer_.stop();
   if (update_thread_.joinable())
     update_thread_.join();
   if (image_thread_.joinable())
@@ -302,6 +352,11 @@ void ROS1Visualizer::report_timing_diagnostics(const ros::WallTimerEvent &) {
   const double image_state_wait_ms = take_max_ms(image_state_lock_wait_timing_.max_ns);
   const uint64_t invalid_odom_count = invalid_fast_odom_count_.exchange(0, std::memory_order_relaxed);
   const auto stats = _app->stats_log_diagnostics();
+  size_t pending;
+  {
+    std::lock_guard<std::mutex> lock(camera_queue_mtx);
+    pending = camera_queue.size();
+  }
   ROS_INFO_STREAM("OpenVINS wall diagnostics window_s=5"
                   << " imu_callbacks=" << imu_count << " imu_max_receipt_gap_ms=" << imu_gap_ms
                   << " imu_feed_count=" << imu_feed_count << " imu_feed_max_ms=" << imu_feed_ms
@@ -313,8 +368,79 @@ void ROS1Visualizer::report_timing_diagnostics(const ros::WallTimerEvent &) {
                   << " camera_state_lock_wait_max_ms=" << cam_state_wait_ms
                   << " image_state_lock_wait_max_ms=" << image_state_wait_ms
                   << " invalid_fast_odom=" << invalid_odom_count
+                  << " camera_queue_pending=" << pending
+                  << " camera_queue_peak=" << camera_queue_peak_.exchange(0)
+                  << " camera_queue_dropped=" << camera_queue_dropped_.load()
+                  << " camera_update_age_max_ms=" << take_max_ms(camera_update_age_max_ns_)
                   << " stats_log_written=" << stats.written << " stats_log_dropped=" << stats.dropped
                   << " stats_log_truncated=" << stats.truncated << " stats_log_queued=" << stats.queued);
+}
+
+void ROS1Visualizer::publish_recording_diagnostics(const ros::WallTimerEvent &) {
+  if (stopping_.load() || pub_recording_diagnostics_.getNumSubscribers() == 0)
+    return;
+  diagnostic_msgs::DiagnosticArray message;
+  message.header.stamp = ros::Time::now();
+  diagnostic_msgs::DiagnosticStatus status;
+  status.name = "openvins/estimator_and_transport";
+  status.hardware_id = "seeker4";
+  status.message = "observations; gated feature counts are not independent accuracy evidence";
+  auto add = [&status](const std::string &key, const auto &value) {
+    std::ostringstream text;
+    text << std::setprecision(17) << value;
+    diagnostic_msgs::KeyValue pair;
+    pair.key = key; pair.value = text.str(); status.values.push_back(std::move(pair));
+  };
+  // This observer never waits on the hot path. Queue/state snapshots may be
+  // from adjacent instants and explicitly flag a skipped state snapshot.
+  {
+    std::unique_lock<std::mutex> lock(camera_queue_mtx, std::try_to_lock);
+    add("queue_snapshot_available", lock.owns_lock());
+    if (lock.owns_lock()) {
+      add("queue_images", camera_queue.size());
+      add("latest_imu_stamp_s", latest_imu_timestamp_);
+      add("queue_oldest_stamp_s", camera_queue.empty() ? -1.0 : camera_queue.front().timestamp);
+      add("queue_newest_stamp_s", camera_queue.empty() ? -1.0 : camera_queue.back().timestamp);
+    }
+  }
+  add("queue_dropped_images", camera_queue_dropped_.load());
+  {
+    std::unique_lock<std::mutex> lock(_app->get_state_mutex(), std::try_to_lock);
+    add("state_snapshot_available", lock.owns_lock());
+    if (lock.owns_lock()) {
+      const auto state = _app->get_state();
+      const auto updates = _app->update_diagnostics();
+      add("initialized_estimator", _app->initialized_estimator());
+      add("initialized_output", _app->initialized());
+      add("state_stamp_s", state->_timestamp);
+      add("state_age_s", message.header.stamp.toSec() - state->_timestamp);
+      add("camera_imu_offset_s", state->_calib_dt_CAMtoIMU->value()(0));
+      const auto bg = state->_imu->bias_g(), ba = state->_imu->bias_a(), velocity = state->_imu->vel();
+      for (int i=0; i<3; ++i) {
+        add("gyro_bias_" + std::to_string(i), bg(i));
+        add("accel_bias_" + std::to_string(i), ba(i));
+        add("velocity_global_" + std::to_string(i), velocity(i));
+      }
+      add("clones", state->_clones_IMU.size());
+      add("slam_landmarks", state->_features_SLAM.size());
+      add("zupt_accepted", updates.zupt_accepted);
+      add("last_zupt_stamp_s", updates.last_zupt_stamp);
+      add("moved_since_zupt", updates.moved_since_zupt);
+      add("last_zupt", updates.last_zupt);
+      add("msckf_gated_features_last", updates.msckf_gated_last);
+      add("msckf_gated_features_total", updates.msckf_gated_total);
+      add("last_msckf_stamp_s", updates.last_msckf_stamp);
+      add("slam_gated_features_last", updates.slam_gated_last);
+      add("slam_gated_features_total", updates.slam_gated_total);
+      add("last_slam_stamp_s", updates.last_slam_stamp);
+      add("camera_bundles", camera_sync_bundle_count_);
+    } else {
+      status.level = diagnostic_msgs::DiagnosticStatus::WARN;
+      status.message = "estimator busy; state snapshot skipped without waiting";
+    }
+  }
+  message.status.push_back(std::move(status));
+  pub_recording_diagnostics_.publish(message);
 }
 
 void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> parser) {
@@ -326,12 +452,12 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
   std::string topic_imu;
   _nh->param<std::string>("topic_imu", topic_imu, "/imu0");
   parser->parse_external("relative_config_imu", "imu0", "rostopic", topic_imu);
-  sub_imu = _nh->subscribe(topic_imu, 1000, &ROS1Visualizer::callback_inertial, this);
+  sub_imu = _nh->subscribe(topic_imu, 1000, &ROS1Visualizer::callback_inertial, this, ros::TransportHints().tcpNoDelay());
   PRINT_INFO("subscribing to IMU: %s\n", topic_imu.c_str());
 
   // Logic for sync stereo subscriber
   // https://answers.ros.org/question/96346/subscribe-to-two-image_raws-with-one-function/?answer=96491#post-id-96491
-  if (_app->get_params().state_options.num_cameras == 2) {
+  if (expected_cameras_ == 2) {
     // Read in the topics
     std::string cam_topic0, cam_topic1;
     _nh->param<std::string>("topic_camera" + std::to_string(0), cam_topic0, "/cam" + std::to_string(0) + "/image_raw");
@@ -339,8 +465,8 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
     parser->parse_external("relative_config_imucam", "cam" + std::to_string(0), "rostopic", cam_topic0);
     parser->parse_external("relative_config_imucam", "cam" + std::to_string(1), "rostopic", cam_topic1);
     // Create sync filter (they have unique pointers internally, so we have to use move logic here...)
-    auto image_sub0 = std::make_shared<message_filters::Subscriber<sensor_msgs::Image>>(*_nh, cam_topic0, 1);
-    auto image_sub1 = std::make_shared<message_filters::Subscriber<sensor_msgs::Image>>(*_nh, cam_topic1, 1);
+    auto image_sub0 = std::make_shared<message_filters::Subscriber<sensor_msgs::Image>>(*_nh, cam_topic0, camera_subscriber_queue_size_);
+    auto image_sub1 = std::make_shared<message_filters::Subscriber<sensor_msgs::Image>>(*_nh, cam_topic1, camera_subscriber_queue_size_);
     auto sync = std::make_shared<message_filters::Synchronizer<sync_pol>>(sync_pol(10), *image_sub0, *image_sub1);
     sync->registerCallback(boost::bind(&ROS1Visualizer::callback_stereo, this, _1, _2, 0, 1));
     // Append to our vector of subscribers
@@ -351,13 +477,13 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
     PRINT_INFO("subscribing to cam (stereo): %s\n", cam_topic1.c_str());
   } else {
     // Now we should add any non-stereo callbacks here
-    for (int i = 0; i < _app->get_params().state_options.num_cameras; i++) {
+    for (size_t i = 0; i < expected_cameras_; i++) {
       // read in the topic
       std::string cam_topic;
       _nh->param<std::string>("topic_camera" + std::to_string(i), cam_topic, "/cam" + std::to_string(i) + "/image_raw");
       parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "rostopic", cam_topic);
       // create subscriber
-      subs_cam.push_back(_nh->subscribe<sensor_msgs::Image>(cam_topic, 10, boost::bind(&ROS1Visualizer::callback_monocular, this, _1, i)));
+      subs_cam.push_back(_nh->subscribe<sensor_msgs::Image>(cam_topic, camera_subscriber_queue_size_, boost::bind(&ROS1Visualizer::callback_monocular, this, _1, i)));
       PRINT_INFO("subscribing to cam (mono): %s\n", cam_topic.c_str());
     }
   }
@@ -375,7 +501,7 @@ void ROS1Visualizer::visualize() {
   // rT0_1 = boost::posix_time::microsec_clock::local_time();
 
   // publish current image (only if not multi-threaded)
-  if (!_app->get_params().use_multi_threading_pubs)
+  if (!async_pubs_)
     publish_images();
 
   // Return if we have not inited
@@ -689,143 +815,134 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   // can start or join a worker that needs the camera queue.
   state_lock.unlock();
 
-  // If the processing queue is currently active / running just return so we can keep getting measurements
-  // Otherwise create a second thread to do our update in an async manor
-  // The visualization of the state, images, and features will be synchronous with the update!
-  std::lock_guard<std::mutex> ownership_lock(worker_ownership_mtx_);
-  if (stopping_.load() || thread_update_running.exchange(true))
-    return;
-  if (update_thread_.joinable())
-    update_thread_.join();
-  // The asynchronous update must not retain the callback's stack message.
-  const double latest_imu_timestamp = message.timestamp;
-  auto update_task = [this, latest_imu_timestamp] {
-    // Lock on the queue (prevents new images from appending)
-    std::lock_guard<std::mutex> lck(camera_queue_mtx);
-
-    // Count how many unique image streams
-    std::map<int, bool> unique_cam_ids;
-    for (const auto &cam_msg : camera_queue) {
-      unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
-    }
-
-    // If we do not have enough unique cameras then we need to wait
-    // We should wait till we have one of each camera to ensure we propagate in the correct order
-    auto params = _app->get_params();
-    size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
-    if (unique_cam_ids.size() == num_unique_cameras) {
-
-      // Loop through our queue and see if we are able to process any of our camera measurements.
-      // In the four-camera Seeker4 simulation, images within the configured
-      // tolerance are one CameraData update so they augment a single clone.
-      double timestamp_imu_inC;
-      {
-        // Calibration is estimator state too: snapshot it under queue -> state
-        // before deciding which queued images the latest IMU can cover.
-        std::lock_guard<std::mutex> state_lock(_app->get_state_mutex());
-        timestamp_imu_inC = latest_imu_timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
-      }
-      while (!stopping_.load() && !camera_queue.empty()) {
-        const ov_core::CameraData first_message = camera_queue.front();
-        if (first_message.timestamp >= timestamp_imu_inC)
-          break;
-
-        ov_core::CameraData update_message = first_message;
-        std::vector<size_t> consumed_indices{0};
-        bool bundled = false;
-        double bundle_span = 0.0;
-
-        const size_t expected_cameras = params.state_options.num_cameras;
-        if (camera_sync_tolerance_s_ > 0.0 && expected_cameras > 2 && first_message.sensor_ids.size() == 1) {
-          const double group_end = first_message.timestamp + camera_sync_tolerance_s_;
-          std::map<int, size_t> group_members;
-          std::map<int, double> latest_queued_stamp;
-          for (size_t index = 0; index < camera_queue.size(); ++index) {
-            const auto &candidate = camera_queue.at(index);
-            if (candidate.sensor_ids.size() != 1)
-              continue;
-            const int camera_id = candidate.sensor_ids.front();
-            if (camera_id < 0 || static_cast<size_t>(camera_id) >= expected_cameras)
-              continue;
-            latest_queued_stamp[camera_id] = candidate.timestamp;
-            if (candidate.timestamp <= group_end)
-              group_members.emplace(camera_id, index);
-          }
-
-          if (group_members.size() == expected_cameras) {
-            double latest_timestamp = first_message.timestamp;
-            double timestamp_sum = 0.0;
-            update_message.sensor_ids.clear();
-            update_message.images.clear();
-            update_message.masks.clear();
-            consumed_indices.clear();
-            for (const auto &member : group_members) {
-              const auto &camera_message = camera_queue.at(member.second);
-              latest_timestamp = std::max(latest_timestamp, camera_message.timestamp);
-              timestamp_sum += camera_message.timestamp;
-              update_message.sensor_ids.push_back(member.first);
-              update_message.images.push_back(camera_message.images.front());
-              update_message.masks.push_back(camera_message.masks.front());
-              consumed_indices.push_back(member.second);
-            }
-            // CameraData has one timestamp for every image. The mean minimizes
-            // the maximum timestamp adjustment within this bounded group.
-            update_message.timestamp = timestamp_sum / static_cast<double>(group_members.size());
-            bundle_span = latest_timestamp - first_message.timestamp;
-            if (latest_timestamp >= timestamp_imu_inC)
-              break;
-            bundled = true;
-          } else if (camera_bundle_wait_for_missing(expected_cameras, group_members, latest_queued_stamp, group_end)) {
-            // IMU time can already be ahead while the remaining camera
-            // callbacks are in transport. Only newer queued images from every
-            // missing camera prove this group can no longer become complete.
-            break;
-          }
-        }
-
-        const PhaseSnapshot state_lock_start = phase_snapshot();
-        std::lock_guard<std::mutex> state_lock(_app->get_state_mutex());
-        record_timing(camera_state_lock_wait_timing_, "camera_state_lock_wait", state_lock_start,
-                      update_message.timestamp);
-        const PhaseSnapshot camera_feed_start = phase_snapshot();
-        _app->feed_measurement_camera(update_message);
-        record_timing(camera_feed_timing_, "feed_measurement_camera", camera_feed_start,
-                      update_message.timestamp);
-        const PhaseSnapshot camera_visualize_start = phase_snapshot();
-        visualize();
-        record_timing(camera_visualize_timing_, "visualize_camera_update", camera_visualize_start,
-                      update_message.timestamp);
-        if (bundled) {
-          std::sort(consumed_indices.begin(), consumed_indices.end());
-          for (auto index = consumed_indices.rbegin(); index != consumed_indices.rend(); ++index) {
-            camera_queue.erase(camera_queue.begin() + *index);
-          }
-          ++camera_sync_bundle_count_;
-          if (camera_sync_bundle_count_ % 100 == 1) {
-            // This path still owns camera/state locks. Never wait on stdout.
-            char record[512];
-            const int count = std::snprintf(record, sizeof(record),
-                "Camera sync bundles: %zu (latest span %.3f s)\n", camera_sync_bundle_count_, bundle_span);
-            if (count > 0 && static_cast<std::size_t>(count) < sizeof(record))
-              _app->enqueue_info_diagnostic(record, static_cast<std::size_t>(count));
-          }
-        } else {
-          camera_queue.pop_front();
-        }
-      }
-    }
-    thread_update_running = false;
-  };
-  try {
-    update_thread_ = std::thread(update_task);
-  } catch (...) {
-    thread_update_running = false;
-    throw;
+  {
+    std::lock_guard<std::mutex> lock(camera_queue_mtx);
+    latest_imu_timestamp_ = message.timestamp;
+    ++camera_queue_generation_;
   }
-  // If we are single threaded, then run single threaded.
-  // Otherwise retain ownership for a later callback or shutdown to join.
-  if (!_app->get_params().use_multi_threading_subs)
-    update_thread_.join();
+  camera_queue_cv_.notify_one();
+  if (!async_subs_)
+    process_camera_queue();
+}
+
+void ROS1Visualizer::process_camera_queue() {
+  // Queue ownership covers selection/removal only. The estimator and all ROS
+  // publications run after it is released, so camera ingress never waits for
+  // an entire visual update or a catch-up loop.
+  while (!stopping_.load()) {
+    double latest_imu;
+    {
+      std::lock_guard<std::mutex> lock(camera_queue_mtx);
+      if (camera_queue.empty())
+        return;
+      latest_imu = latest_imu_timestamp_;
+    }
+    double timestamp_imu_inC;
+    {
+      std::lock_guard<std::mutex> state_lock(_app->get_state_mutex());
+      timestamp_imu_inC = latest_imu - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+    }
+    ov_core::CameraData update_message;
+    bool bundled = false;
+    double bundle_span = 0;
+    {
+      std::lock_guard<std::mutex> lock(camera_queue_mtx);
+      if (camera_queue.empty() || camera_queue.front().timestamp >= timestamp_imu_inC)
+        return;
+      std::map<int, bool> unique_ids;
+      for (const auto &camera : camera_queue)
+        unique_ids[camera.sensor_ids.front()] = true;
+      const size_t streams = expected_cameras_ == 2 ? 1 : expected_cameras_;
+      if (unique_ids.size() < streams)
+        return;
+      const auto &first = camera_queue.front();
+      update_message = first;
+      std::vector<size_t> consumed{0};
+      if (camera_sync_tolerance_s_ > 0 && expected_cameras_ > 2 && first.sensor_ids.size() == 1) {
+        const double group_end = first.timestamp + camera_sync_tolerance_s_;
+        std::map<int, size_t> members;
+        std::map<int, double> latest;
+        for (size_t i = 0; i < camera_queue.size(); ++i) {
+          const auto &candidate = camera_queue[i];
+          if (candidate.sensor_ids.size() != 1)
+            continue;
+          const int id = candidate.sensor_ids.front();
+          if (id < 0 || static_cast<size_t>(id) >= expected_cameras_)
+            continue;
+          latest[id] = candidate.timestamp;
+          if (candidate.timestamp <= group_end)
+            members.emplace(id, i);
+        }
+        if (members.size() == expected_cameras_) {
+          double max_stamp = first.timestamp, sum = 0;
+          update_message.sensor_ids.clear();
+          update_message.images.clear();
+          update_message.masks.clear();
+          consumed.clear();
+          for (const auto &member : members) {
+            const auto &camera = camera_queue[member.second];
+            max_stamp = std::max(max_stamp, camera.timestamp);
+            sum += camera.timestamp;
+            update_message.sensor_ids.push_back(member.first);
+            update_message.images.push_back(camera.images.front());
+            update_message.masks.push_back(camera.masks.front());
+            consumed.push_back(member.second);
+          }
+          if (max_stamp >= timestamp_imu_inC)
+            return;
+          update_message.timestamp = sum / static_cast<double>(members.size());
+          bundle_span = max_stamp - first.timestamp;
+          bundled = true;
+        } else if (camera_bundle_wait_for_missing(expected_cameras_, members, latest, group_end)) {
+          return;
+        }
+      }
+      std::sort(consumed.begin(), consumed.end());
+      for (auto i = consumed.rbegin(); i != consumed.rend(); ++i)
+        camera_queue.erase(camera_queue.begin() + *i);
+    }
+    // One measurement per lock acquisition lets queued IMUs feed between
+    // visual updates. Sensor timestamps and estimator settings are untouched.
+    const PhaseSnapshot lock_start = phase_snapshot();
+    std::lock_guard<std::mutex> state_lock(_app->get_state_mutex());
+    record_timing(camera_state_lock_wait_timing_, "camera_state_lock_wait", lock_start, update_message.timestamp);
+    const PhaseSnapshot feed_start = phase_snapshot();
+    _app->feed_measurement_camera(update_message);
+    record_timing(camera_feed_timing_, "feed_measurement_camera", feed_start, update_message.timestamp);
+    const PhaseSnapshot vis_start = phase_snapshot();
+    visualize();
+    record_timing(camera_visualize_timing_, "visualize_camera_update", vis_start, update_message.timestamp);
+    const double age = ros::Time::now().toSec() - update_message.timestamp;
+    if (age > 0 && std::isfinite(age))
+      update_timing_max(camera_update_age_max_ns_, static_cast<uint64_t>(age * 1e9));
+    if (bundled && ++camera_sync_bundle_count_ % 100 == 1) {
+      char record[256];
+      const int n = std::snprintf(record, sizeof(record), "Camera sync bundles: %zu (latest span %.3f s)\n",
+                                  camera_sync_bundle_count_, bundle_span);
+      if (n > 0 && static_cast<size_t>(n) < sizeof(record))
+        _app->enqueue_info_diagnostic(record, static_cast<size_t>(n));
+    }
+  }
+}
+
+void ROS1Visualizer::enqueue_camera(ov_core::CameraData message, double timestamp, const char *phase) {
+  const auto start = phase_snapshot();
+  {
+    std::lock_guard<std::mutex> lock(camera_queue_mtx);
+    record_timing(camera_queue_lock_timing_, phase, start, timestamp);
+    if (timestamp <= camera_dropped_through_) {
+      camera_queue_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    const auto where = std::upper_bound(camera_queue.begin(), camera_queue.end(), message);
+    camera_queue.insert(where, std::move(message));
+    const size_t dropped = trim_camera_backlog(camera_queue, static_cast<size_t>(camera_queue_max_messages_),
+        camera_queue_max_span_s_, camera_sync_tolerance_s_, camera_dropped_through_);
+    camera_queue_dropped_.fetch_add(dropped, std::memory_order_relaxed);
+    update_timing_max(camera_queue_peak_, camera_queue.size());
+    ++camera_queue_generation_;
+  }
+  camera_queue_cv_.notify_one();
 }
 
 void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, int cam_id0) {
@@ -834,16 +951,13 @@ void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, 
 
   // Check if we should drop this image
   double timestamp = msg0->header.stamp.toSec();
-  double time_delta = 1.0 / _app->get_params().track_frequency;
+  double time_delta = camera_min_interval_s_;
   {
     std::lock_guard<std::mutex> timestamp_lock(camera_last_timestamp_mtx);
-    if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
+    if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta)
       return;
-    }
     camera_last_timestamp[cam_id0] = timestamp;
   }
-
-  // Get the image
   cv_bridge::CvImageConstPtr cv_ptr;
   try {
     cv_ptr = cv_bridge::toCvShare(msg0, sensor_msgs::image_encodings::MONO8);
@@ -860,18 +974,13 @@ void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, 
 
   // Load the mask if we are using it, else it is empty
   // TODO: in the future we should get this from external pixel segmentation
-  if (_app->get_params().use_mask) {
-    message.masks.push_back(_app->get_params().masks.at(cam_id0));
+  if (!camera_masks_.empty()) {
+    message.masks.push_back(camera_masks_.at(cam_id0));
   } else {
     message.masks.push_back(cv::Mat::zeros(cv_ptr->image.rows, cv_ptr->image.cols, CV_8UC1));
   }
 
-  // append it to our queue of images
-  const PhaseSnapshot lock_wait_start = phase_snapshot();
-  std::unique_lock<std::mutex> lck(camera_queue_mtx);
-  record_timing(camera_queue_lock_timing_, "camera_queue_lock_monocular", lock_wait_start, timestamp);
-  camera_queue.push_back(message);
-  std::sort(camera_queue.begin(), camera_queue.end());
+  enqueue_camera(std::move(message), timestamp, "camera_queue_lock_monocular");
 }
 
 void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, const sensor_msgs::ImageConstPtr &msg1, int cam_id0,
@@ -881,7 +990,7 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
 
   // Check if we should drop this image
   double timestamp = msg0->header.stamp.toSec();
-  double time_delta = 1.0 / _app->get_params().track_frequency;
+  double time_delta = camera_min_interval_s_;
   {
     std::lock_guard<std::mutex> timestamp_lock(camera_last_timestamp_mtx);
     if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
@@ -918,21 +1027,16 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
 
   // Load the mask if we are using it, else it is empty
   // TODO: in the future we should get this from external pixel segmentation
-  if (_app->get_params().use_mask) {
-    message.masks.push_back(_app->get_params().masks.at(cam_id0));
-    message.masks.push_back(_app->get_params().masks.at(cam_id1));
+  if (!camera_masks_.empty()) {
+    message.masks.push_back(camera_masks_.at(cam_id0));
+    message.masks.push_back(camera_masks_.at(cam_id1));
   } else {
     // message.masks.push_back(cv::Mat(cv_ptr0->image.rows, cv_ptr0->image.cols, CV_8UC1, cv::Scalar(255)));
     message.masks.push_back(cv::Mat::zeros(cv_ptr0->image.rows, cv_ptr0->image.cols, CV_8UC1));
     message.masks.push_back(cv::Mat::zeros(cv_ptr1->image.rows, cv_ptr1->image.cols, CV_8UC1));
   }
 
-  // append it to our queue of images
-  const PhaseSnapshot lock_wait_start = phase_snapshot();
-  std::unique_lock<std::mutex> lck(camera_queue_mtx);
-  record_timing(camera_queue_lock_timing_, "camera_queue_lock_stereo", lock_wait_start, timestamp);
-  camera_queue.push_back(message);
-  std::sort(camera_queue.begin(), camera_queue.end());
+  enqueue_camera(std::move(message), timestamp, "camera_queue_lock_stereo");
 }
 
 void ROS1Visualizer::publish_state() {
@@ -982,14 +1086,15 @@ void ROS1Visualizer::publish_state() {
   // Create our path (imu)
   // NOTE: We downsample the number of poses as needed to prevent rviz crashes
   // NOTE: https://github.com/ros-visualization/rviz/issues/1107
-  nav_msgs::Path arrIMU;
-  arrIMU.header.stamp = ros::Time::now();
-  arrIMU.header.seq = poses_seq_imu;
-  arrIMU.header.frame_id = "global";
-  for (size_t i = 0; i < poses_imu.size(); i += std::floor((double)poses_imu.size() / 16384.0) + 1) {
-    arrIMU.poses.push_back(poses_imu.at(i));
+  if (pub_pathimu.getNumSubscribers() != 0) {
+    nav_msgs::Path arrIMU;
+    arrIMU.header.stamp = ros::Time::now();
+    arrIMU.header.seq = poses_seq_imu;
+    arrIMU.header.frame_id = "global";
+    for (size_t i = 0; i < poses_imu.size(); i += std::floor((double)poses_imu.size() / 16384.0) + 1)
+      arrIMU.poses.push_back(poses_imu.at(i));
+    pub_pathimu.publish(arrIMU);
   }
-  pub_pathimu.publish(arrIMU);
 
   // Move them forward in time
   poses_seq_imu++;

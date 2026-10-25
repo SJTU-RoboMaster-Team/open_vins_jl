@@ -22,6 +22,7 @@
 #ifndef OV_MSCKF_ROS1VISUALIZER_H
 #define OV_MSCKF_ROS1VISUALIZER_H
 
+#include <diagnostic_msgs/DiagnosticArray.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <image_transport/image_transport.h>
@@ -43,6 +44,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -155,6 +157,7 @@ protected:
   void record_timing(TimingStats &stats, const char *phase, const PhaseSnapshot &start,
                      double sensor_stamp);
   void report_timing_diagnostics(const ros::WallTimerEvent &event);
+  void publish_recording_diagnostics(const ros::WallTimerEvent &event);
 
   /// Publish per-camera loop calibration independently of the active tracks.
   /// See the definition for why it must not sit behind the track gates.
@@ -163,6 +166,8 @@ protected:
   /// Caller must quiesce external ROS callbacks before destroying this object.
   /// Joins never run while holding estimator state or camera queue locks.
   void stop_workers();
+  void process_camera_queue();
+  void enqueue_camera(ov_core::CameraData message, double timestamp, const char *phase);
 
   /// Global node handler
   std::shared_ptr<ros::NodeHandle> _nh;
@@ -176,6 +181,7 @@ protected:
   // Our publishers
   image_transport::Publisher it_pub_tracks, it_pub_loop_img_depth, it_pub_loop_img_depth_color;
   ros::Publisher pub_poseimu, pub_odomimu, pub_pathimu;
+  ros::Publisher pub_recording_diagnostics_;
   ros::Publisher pub_points_msckf, pub_points_slam, pub_points_aruco, pub_points_sim;
   ros::Publisher pub_loop_pose, pub_loop_point;
   // One calibration publisher per camera. Camera 0 keeps the historical
@@ -209,12 +215,16 @@ protected:
   boost::posix_time::ptime rT1, rT2;
 
   // Thread atomics
-  std::atomic<bool> thread_update_running;
+  bool async_subs_ = false;
+  bool async_pubs_ = false;
+  std::size_t expected_cameras_ = 1;
+  double camera_min_interval_s_ = 0;
+  std::map<size_t, cv::Mat> camera_masks_;
   std::atomic<bool> stopping_{false};
   std::mutex worker_ownership_mtx_;
   std::thread image_thread_, update_thread_;
   bool workers_stopped_ = false;
-  ros::WallTimer timing_diagnostics_timer_;
+  ros::WallTimer timing_diagnostics_timer_, recording_diagnostics_timer_;
   std::atomic<uint64_t> imu_callback_count_{0};
   std::atomic<uint64_t> imu_last_receipt_ns_{0};
   std::atomic<uint64_t> imu_max_receipt_gap_ns_{0};
@@ -242,6 +252,16 @@ protected:
   /// a nice feature to have for general robustness to bad camera drivers.
   std::deque<ov_core::CameraData> camera_queue;
   std::mutex camera_queue_mtx;
+  std::condition_variable camera_queue_cv_;
+  uint64_t camera_queue_generation_ = 0;
+  double latest_imu_timestamp_ = -1;
+  int camera_queue_max_messages_ = 16;
+  int camera_subscriber_queue_size_ = 2;
+  double camera_queue_max_span_s_ = 0.15;
+  double camera_dropped_through_ = -1;
+  std::atomic<uint64_t> camera_queue_dropped_{0};
+  std::atomic<uint64_t> camera_queue_peak_{0};
+  std::atomic<uint64_t> camera_update_age_max_ns_{0};
   // Optional tolerance for treating near-synchronous monocular cameras as one
   // estimator update. Zero preserves the stock one-message-per-update behavior.
   double camera_sync_tolerance_s_ = 0.0;

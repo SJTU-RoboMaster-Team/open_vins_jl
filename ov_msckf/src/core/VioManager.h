@@ -123,6 +123,21 @@ public:
   /// Timestamp that the system was initialized at
   double initialized_time() { return startup_time; }
 
+  /// Observations only. Caller holds get_state_mutex(); no estimator decisions
+  /// depend on these counters. Gated counts are the updater's surviving features.
+  struct UpdateDiagnostics {
+    uint64_t zupt_accepted = 0, msckf_gated_total = 0, slam_gated_total = 0;
+    size_t msckf_gated_last = 0, slam_gated_last = 0;
+    double last_zupt_stamp = -1, last_msckf_stamp = -1, last_slam_stamp = -1;
+    bool moved_since_zupt = false, last_zupt = false;
+  };
+  UpdateDiagnostics update_diagnostics() const {
+    auto result = update_diagnostics_;
+    result.moved_since_zupt = has_moved_since_zupt;
+    result.last_zupt = did_zupt_update;
+    return result;
+  }
+
   /// Accessor for current system parameters
   VioManagerOptions get_params() { return params; }
 
@@ -258,6 +273,7 @@ protected:
   std::thread initialization_thread_;
 
   // If we did a zero velocity update
+  UpdateDiagnostics update_diagnostics_;
   bool did_zupt_update = false;
   bool has_moved_since_zupt = false;
 
