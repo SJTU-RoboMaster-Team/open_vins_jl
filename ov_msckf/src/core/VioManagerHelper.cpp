@@ -221,7 +221,8 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
   assert(state->_clones_IMU.find(message.timestamp) != state->_clones_IMU.end());
   active_tracks_time = message.timestamp;
   active_image = cv::Mat();
-  trackFEATS->display_active(active_image, 255, 255, 255, 255, 255, 255, " ");
+  if (active_image_enabled_)
+    trackFEATS->display_active(active_image, 255, 255, 255, 255, 255, 255, " ");
   if (!active_image.empty()) {
     active_image = active_image(cv::Rect(0, 0, message.images.at(0).cols, message.images.at(0).rows));
   }

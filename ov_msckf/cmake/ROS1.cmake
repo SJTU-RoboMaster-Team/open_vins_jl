@@ -133,6 +133,12 @@ if (catkin_FOUND AND ENABLE_ROS)
     )
 
     if(CATKIN_ENABLE_TESTING)
+        catkin_add_gtest(test_camera_tracking_lock test/test_camera_tracking_lock.cpp)
+        if(TARGET test_camera_tracking_lock)
+            target_link_libraries(test_camera_tracking_lock
+                    ov_msckf_lib ${thirdparty_libraries} gtest_main)
+        endif()
+
         catkin_add_gtest(test_camera_backlog test/test_camera_backlog.cpp)
         if(TARGET test_camera_backlog)
             target_link_libraries(test_camera_backlog gtest_main)

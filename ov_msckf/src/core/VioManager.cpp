@@ -51,7 +51,7 @@
 #include <chrono>
 #include <cstdint>
 #include <sys/resource.h>
-#include <time.h>
+#include <stdexcept>
 
 using namespace ov_core;
 using namespace ov_type;
@@ -87,24 +87,23 @@ private:
 // Process CPU and process rusage counters include work from concurrent threads.
 struct PhaseMetrics {
   std::chrono::steady_clock::time_point wall;
-  uint64_t thread_cpu_ns = 0;
   struct rusage thread_usage = {};
   struct rusage process_usage = {};
 };
 
-uint64_t current_thread_cpu_ns() {
-  struct timespec ts;
-  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
-  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
-}
-
 PhaseMetrics phase_metrics_now() {
   PhaseMetrics metrics;
   metrics.wall = std::chrono::steady_clock::now();
-  metrics.thread_cpu_ns = current_thread_cpu_ns();
   getrusage(RUSAGE_THREAD, &metrics.thread_usage);
   getrusage(RUSAGE_SELF, &metrics.process_usage);
   return metrics;
+}
+
+uint64_t usage_cpu_ns(const struct rusage &usage) {
+  return static_cast<uint64_t>(usage.ru_utime.tv_sec) * 1000000000ULL +
+         static_cast<uint64_t>(usage.ru_utime.tv_usec) * 1000ULL +
+         static_cast<uint64_t>(usage.ru_stime.tv_sec) * 1000000000ULL +
+         static_cast<uint64_t>(usage.ru_stime.tv_usec) * 1000ULL;
 }
 
 double usage_cpu_ms(const struct rusage &usage) {
@@ -123,9 +122,10 @@ public:
     const PhaseMetrics end = phase_metrics_now();
     const double wall_ms = std::chrono::duration<double, std::milli>(end.wall - start_.wall).count();
     if (wall_ms < 300.0) return;
-    const double thread_cpu_ms = start_.thread_cpu_ns && end.thread_cpu_ns >= start_.thread_cpu_ns
-                                     ? (end.thread_cpu_ns - start_.thread_cpu_ns) / 1e6
-                                     : -1.0;
+    const uint64_t start_cpu_ns = usage_cpu_ns(start_.thread_usage);
+    const uint64_t end_cpu_ns = usage_cpu_ns(end.thread_usage);
+    const double thread_cpu_ms =
+        end_cpu_ns >= start_cpu_ns ? (end_cpu_ns - start_cpu_ns) / 1e6 : -1.0;
     PRINT_WARNING(YELLOW "[SLOW-PHASE] phase=%s sensor_stamp_s=%.9f wall_ms=%.1f thread_cpu_ms=%.1f "
                           "process_cpu_ms_all_threads=%.1f thread_minflt=%ld thread_majflt=%ld "
                           "thread_nvcsw=%ld thread_nivcsw=%ld process_minflt=%ld process_majflt=%ld "
@@ -379,7 +379,15 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
   do_feature_propagate_update(message);
 }
 
-void VioManager::track_image_and_update(const ov_core::CameraData &message_const) {
+void VioManager::feed_measurement_camera(const ov_core::CameraData &message,
+                                        std::unique_lock<std::mutex> &state_lock) {
+  if (!state_lock.owns_lock() || state_lock.mutex() != &estimator_state_mtx)
+    throw std::invalid_argument("camera tracking requires the estimator state lock");
+  track_image_and_update(message, &state_lock);
+}
+
+void VioManager::track_image_and_update(const ov_core::CameraData &message_const,
+                                       std::unique_lock<std::mutex> *state_lock) {
   update_diagnostics_.msckf_gated_last = 0;
   update_diagnostics_.slam_gated_last = 0;
 
@@ -395,23 +403,37 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
 
   // Downsample if we are downsampling
   ov_core::CameraData message = message_const;
-  {
-    SlowPhaseTimer phase("camera_preprocess_downsample", message.timestamp);
-    for (size_t i = 0; i < message.sensor_ids.size() && params.downsample_cameras; i++) {
-      cv::Mat img = message.images.at(i);
-      cv::Mat mask = message.masks.at(i);
-      cv::Mat img_temp, mask_temp;
-      cv::pyrDown(img, img_temp, cv::Size(img.cols / 2.0, img.rows / 2.0));
-      message.images.at(i) = img_temp;
-      cv::pyrDown(mask, mask_temp, cv::Size(mask.cols / 2.0, mask.rows / 2.0));
-      message.masks.at(i) = mask_temp;
+  // Initialization still has readers of the tracker database. Once initialized,
+  // tracking touches only frontend history; IMU propagation can use the unchanged
+  // estimator state concurrently. Always reacquire before ZUPT/backend work.
+  struct TrackingUnlock {
+    std::unique_lock<std::mutex> *lock;
+    bool &active;
+    TrackingUnlock(std::unique_lock<std::mutex> *value, bool &tracking) : lock(value), active(tracking) {
+      if (lock) { active = true; lock->unlock(); }
     }
-  }
-
-  // Perform our feature tracking!
+    ~TrackingUnlock() { if (lock) { lock->lock(); active = false; } }
+  };
   {
-    SlowPhaseTimer phase("camera_feature_tracking", message.timestamp);
-    trackFEATS->feed_new_camera(message);
+    TrackingUnlock unlock(is_initialized_vio ? state_lock : nullptr, tracking_in_progress_);
+    {
+      SlowPhaseTimer phase("camera_preprocess_downsample", message.timestamp);
+      for (size_t i = 0; i < message.sensor_ids.size() && params.downsample_cameras; i++) {
+        cv::Mat img = message.images.at(i);
+        cv::Mat mask = message.masks.at(i);
+        cv::Mat img_temp, mask_temp;
+        cv::pyrDown(img, img_temp, cv::Size(img.cols / 2.0, img.rows / 2.0));
+        message.images.at(i) = img_temp;
+        cv::pyrDown(mask, mask_temp, cv::Size(mask.cols / 2.0, mask.rows / 2.0));
+        message.masks.at(i) = mask_temp;
+      }
+    }
+
+    // Perform our feature tracking!
+    {
+      SlowPhaseTimer phase("camera_feature_tracking", message.timestamp);
+      trackFEATS->feed_new_camera(message);
+    }
   }
 
   // If the aruco tracker is available, the also pass to it
@@ -721,7 +743,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (message.sensor_ids.at(0) == 0) {
 
     // Re-triangulate features
-    retriangulate_active_tracks(message);
+    if (active_tracks_enabled_)
+      retriangulate_active_tracks(message);
 
     // Clear the MSCKF features only on the base camera
     // Thus we should be able to visualize the other unique camera stream

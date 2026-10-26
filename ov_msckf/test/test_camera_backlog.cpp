@@ -53,6 +53,32 @@ TEST(CameraBacklog, MissingCameraCannotGrowQueueForever) {
     EXPECT_LE(q.back().timestamp-q.front().timestamp,.150001);
   }
 }
+TEST(CameraBacklog, ExpiredSingleGroupIsDroppedEvenWithoutQueueSpan) {
+  std::deque<Frame> q;
+  group(q, 10.0);
+  double cutoff = -1;
+  EXPECT_EQ(4u, ov_msckf::trim_camera_backlog(q,16,.15,.001,cutoff,10.4,.15));
+  EXPECT_TRUE(q.empty());
+  EXPECT_NEAR(10.001,cutoff,1e-9);
+}
+TEST(CameraBacklog, AgeLimitRetainsFreshGroupsAndLateMemberWatermark) {
+  std::deque<Frame> q{{10,0},{10.0003,1},{10.0006,2}};
+  group(q, 10.25);
+  double cutoff = -1;
+  EXPECT_EQ(3u, ov_msckf::trim_camera_backlog(q,16,.15,.001,cutoff,10.3,.15));
+  ASSERT_EQ(4u,q.size());
+  EXPECT_DOUBLE_EQ(10.25,q.front().timestamp);
+  EXPECT_LE(10.0009,cutoff);
+}
+TEST(CameraBacklog, DeadlineIncludesSyncToleranceAndPausedOrFutureClock) {
+  std::deque<Frame> q;
+  group(q, 10.0);
+  double cutoff = -1;
+  EXPECT_EQ(0u,ov_msckf::trim_camera_backlog(q,16,.15,.001,cutoff,10.15,.15));
+  EXPECT_EQ(0u,ov_msckf::trim_camera_backlog(q,16,.15,.001,cutoff,9.0,.15));
+  EXPECT_EQ(0u,ov_msckf::trim_camera_backlog(q,16,.15,.001,cutoff,0.0,.15));
+  EXPECT_EQ(4u,ov_msckf::trim_camera_backlog(q,16,.15,.001,cutoff,10.152,.15));
+}
 TEST(CameraBacklog, SyncStillWaitsForInFlightMemberDespiteNewIMU) {
   std::map<int,size_t> members{{0,0},{1,1},{2,2}};
   std::map<int,double> latest{{0,1},{1,1},{2,1}};

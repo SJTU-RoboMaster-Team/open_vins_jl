@@ -12,11 +12,14 @@ namespace ov_msckf {
 template <class Queue>
 std::size_t trim_camera_backlog(Queue &queue, std::size_t max_messages,
                                 double max_span, double sync_tolerance,
-                                double &dropped_through) {
+                                double &dropped_through,
+                                double reference_time = 0.0, double max_age = 0.0) {
   std::size_t dropped = 0;
   while (!queue.empty() &&
          ((max_messages > 0 && queue.size() > max_messages) ||
-          (max_span > 0 && queue.back().timestamp - queue.front().timestamp > max_span + 1e-6))) {
+          (max_span > 0 && queue.back().timestamp - queue.front().timestamp > max_span + 1e-6) ||
+          (max_age > 0 && std::isfinite(reference_time) && reference_time > 0 &&
+           reference_time - (queue.front().timestamp + std::max(0.0, sync_tolerance)) > max_age))) {
     const double group_end = queue.front().timestamp + std::max(0.0, sync_tolerance);
     dropped_through = std::max(dropped_through, group_end);
     do {

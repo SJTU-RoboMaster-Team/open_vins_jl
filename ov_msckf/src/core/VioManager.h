@@ -96,6 +96,10 @@ public:
    */
   void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
 
+  /// ROS1's single camera worker may release its state lock for initialized
+  /// frontend tracking. The lock is held again before any estimator mutation.
+  void feed_measurement_camera(const ov_core::CameraData &message, std::unique_lock<std::mutex> &state_lock);
+
   /**
    * @brief Feed function for a synchronized simulated cameras
    * @param timestamp Time that this image was collected
@@ -138,8 +142,8 @@ public:
     return result;
   }
 
-  /// Accessor for current system parameters
-  VioManagerOptions get_params() { return params; }
+  /// Accessor for the immutable system parameters.
+  const VioManagerOptions &get_params() const { return params; }
 
   /// Accessor to get the current state
   std::shared_ptr<State> get_state() { return state; }
@@ -148,6 +152,9 @@ public:
   /// propagation. The asynchronous initializer uses the same lock. In the
   /// synchronous initializer mode its joining caller already owns the lock.
   std::mutex &get_state_mutex() { return estimator_state_mtx; }
+
+  /// Caller holds get_state_mutex(); debug images wait for a complete frontend.
+  bool tracking_in_progress() const { return tracking_in_progress_; }
 
   /// Accessor to get the current propagator
   std::shared_ptr<Propagator> get_propagator() { return propagator; }
@@ -170,6 +177,25 @@ public:
     image = active_image;
   }
 
+  /// Timestamp of the latest active-track sample, without copying its maps.
+  double get_active_tracks_time() const { return active_tracks_time; }
+
+  /// Output-only caches; caller holds the estimator state mutex. The default
+  /// keeps non-ROS and ROS2 clients unchanged.
+  void set_active_track_output(bool tracks, bool image) {
+    if (!tracks && active_tracks_enabled_) {
+      active_tracks_time = -1;
+      active_image.release();
+      active_tracks_posinG.clear();
+      active_tracks_uvd.clear();
+      active_feat_linsys_A.clear();
+      active_feat_linsys_b.clear();
+      active_feat_linsys_count.clear();
+    }
+    active_tracks_enabled_ = tracks;
+    active_image_enabled_ = image;
+  }
+
   /// Returns active tracked features in the current frame
   void get_active_tracks(double &timestamp, std::unordered_map<size_t, Eigen::Vector3d> &feat_posinG,
                          std::unordered_map<size_t, Eigen::Vector3d> &feat_tracks_uvd) {
@@ -179,6 +205,10 @@ public:
   }
 
 protected:
+  bool tracking_in_progress_ = false;
+  bool active_tracks_enabled_ = true;
+  bool active_image_enabled_ = true;
+
   /**
    * @brief Given a new set of camera images, this will track them.
    *
@@ -187,7 +217,7 @@ protected:
    *
    * @param message Contains our timestamp, images, and camera ids
    */
-  void track_image_and_update(const ov_core::CameraData &message);
+  void track_image_and_update(const ov_core::CameraData &message, std::unique_lock<std::mutex> *state_lock = nullptr);
 
   /**
    * @brief This will do the propagation and feature updates to the state

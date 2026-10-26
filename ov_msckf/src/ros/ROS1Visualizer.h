@@ -154,8 +154,8 @@ protected:
   static uint64_t steady_now_ns();
   static void update_timing_max(std::atomic<uint64_t> &target, uint64_t value);
   static PhaseSnapshot phase_snapshot();
-  void record_timing(TimingStats &stats, const char *phase, const PhaseSnapshot &start,
-                     double sensor_stamp);
+  PhaseSnapshot record_timing(TimingStats &stats, const char *phase,
+                              const PhaseSnapshot &start, double sensor_stamp);
   void report_timing_diagnostics(const ros::WallTimerEvent &event);
   void publish_recording_diagnostics(const ros::WallTimerEvent &event);
 
@@ -167,7 +167,17 @@ protected:
   /// Joins never run while holding estimator state or camera queue locks.
   void stop_workers();
   void process_camera_queue();
-  void enqueue_camera(ov_core::CameraData message, double timestamp, const char *phase);
+  struct CameraInput {
+    double timestamp = 0;
+    std::vector<int> sensor_ids;
+    std::vector<sensor_msgs::ImageConstPtr> images;
+    bool operator<(const CameraInput &other) const {
+      return timestamp == other.timestamp ? sensor_ids.front() < other.sensor_ids.front() : timestamp < other.timestamp;
+    }
+  };
+  void enqueue_camera(CameraInput message, const char *phase);
+  void trim_camera_queue(double now);
+  bool camera_input_expired(double timestamp, double now) const;
 
   /// Global node handler
   std::shared_ptr<ros::NodeHandle> _nh;
@@ -220,6 +230,9 @@ protected:
   std::size_t expected_cameras_ = 1;
   double camera_min_interval_s_ = 0;
   std::map<size_t, cv::Mat> camera_masks_;
+  // Immutable zero masks are shared when no configured mask is present.
+  // TrackKLT only reads these masks, so allocating one per image is unnecessary.
+  std::vector<cv::Mat> zero_camera_masks_;
   std::atomic<bool> stopping_{false};
   std::mutex worker_ownership_mtx_;
   std::thread image_thread_, update_thread_;
@@ -250,7 +263,7 @@ protected:
   /// exactly one IMU measurement with timestamp newer than the camera measurement
   /// This also handles out-of-order camera measurements, which is rare, but
   /// a nice feature to have for general robustness to bad camera drivers.
-  std::deque<ov_core::CameraData> camera_queue;
+  std::deque<CameraInput> camera_queue;
   std::mutex camera_queue_mtx;
   std::condition_variable camera_queue_cv_;
   uint64_t camera_queue_generation_ = 0;
@@ -258,8 +271,12 @@ protected:
   int camera_queue_max_messages_ = 16;
   int camera_subscriber_queue_size_ = 2;
   double camera_queue_max_span_s_ = 0.15;
+  double camera_queue_max_age_s_ = 0.15;
+  bool camera_tracking_outside_state_lock_ = true;
+  bool demand_driven_loop_output_ = true;
   double camera_dropped_through_ = -1;
   std::atomic<uint64_t> camera_queue_dropped_{0};
+  std::atomic<uint64_t> camera_queue_expired_{0};
   std::atomic<uint64_t> camera_queue_peak_{0};
   std::atomic<uint64_t> camera_update_age_max_ns_{0};
   // Optional tolerance for treating near-synchronous monocular cameras as one
@@ -287,6 +304,7 @@ protected:
   std::vector<geometry_msgs::PoseStamped> poses_gt;
   bool publish_global2imu_tf = true;
   bool publish_calibration_tf = true;
+  bool path_history_without_subscribers_ = true;
 
   // Files and if we should save total state
   bool save_total_state = false;
