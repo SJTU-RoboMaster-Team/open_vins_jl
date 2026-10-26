@@ -54,6 +54,15 @@ class Feature;
 class FeatureDatabase {
 
 public:
+  struct StereoObservation {
+    size_t feature_id = 0;
+    Eigen::Vector2d uv0 = Eigen::Vector2d::Zero();
+    Eigen::Vector2d uv1 = Eigen::Vector2d::Zero();
+  };
+
+  /// Copy only latest same-ID, same-time camera 0/1 pixels under one database lock.
+  std::vector<StereoObservation> latest_stereo_observations(double timestamp);
+
   /**
    * @brief Default constructor
    */

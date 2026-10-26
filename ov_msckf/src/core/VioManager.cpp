@@ -49,6 +49,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <sys/resource.h>
 #include <stdexcept>
@@ -281,6 +282,17 @@ VioManager::StatsLogDiagnostics VioManager::stats_log_diagnostics() const {
   result.truncated = counters.truncated;
   result.queued = counters.queued;
   return result;
+}
+
+std::vector<VioManager::InstantStereoObservation>
+VioManager::get_instant_stereo_observations(double timestamp, const std::unique_lock<std::mutex> &state_lock) {
+  std::vector<InstantStereoObservation> observations;
+  if (!state_lock.owns_lock() || state_lock.mutex() != &estimator_state_mtx)
+    throw std::invalid_argument("instant stereo observations require the estimator state lock");
+  if (!trackFEATS || !trackFEATS->get_feature_database() || !std::isfinite(timestamp))
+    return observations;
+
+  return trackFEATS->get_feature_database()->latest_stereo_observations(timestamp);
 }
 
 bool VioManager::enqueue_info_diagnostic(const char *data, std::size_t size) {

@@ -32,6 +32,9 @@
 #include "utils/sensor_data.h"
 #include "utils/camera_sync.h"
 #include "utils/camera_backlog.h"
+#include "utils/instant_stereo.h"
+#include "cam/CamRadtan.h"
+#include <geometry_msgs/Point32.h>
 
 #include <cmath>
 #include <cstdio>
@@ -50,6 +53,31 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   async_subs_ = options.use_multi_threading_subs;
   async_pubs_ = options.use_multi_threading_pubs;
   expected_cameras_ = options.state_options.num_cameras;
+  nh->param<bool>("stereo_points_enabled", stereo_points_enabled_, false);
+  if (stereo_points_enabled_) {
+    if (expected_cameras_ != 2 || !options.use_stereo)
+      throw std::invalid_argument("stereo_points_enabled requires exactly two cameras and use_stereo=true");
+    for (size_t cam = 0; cam < 2; ++cam) {
+      const auto camera = options.camera_intrinsics.find(cam);
+      if (camera == options.camera_intrinsics.end() ||
+          std::dynamic_pointer_cast<CamRadtan>(camera->second) == nullptr)
+        throw std::invalid_argument("stereo_points_enabled requires pinhole-radtan cameras");
+      const cv::Matx33d cv_k = camera->second->get_K();
+      const cv::Vec4d distortion = camera->second->get_D();
+      Eigen::Matrix3d k;
+      for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+          k(row, col) = cv_k(row, col);
+      if (!k.allFinite() || k(0, 0) <= 0 || k(1, 1) <= 0 || std::abs(k(2, 2) - 1.0) > 1e-12 ||
+          std::abs(k(0, 1)) > 1e-12 || std::abs(k(1, 0)) > 1e-12 ||
+          std::abs(k(2, 0)) > 1e-12 || std::abs(k(2, 1)) > 1e-12)
+        throw std::invalid_argument("stereo_points_enabled requires valid pinhole intrinsics");
+      for (int i = 0; i < 4; ++i) {
+        if (!std::isfinite(distortion[i]) || std::abs(distortion[i]) > 1e-12)
+          throw std::invalid_argument("stereo_points_enabled requires zero distortion coefficients");
+      }
+    }
+  }
   camera_min_interval_s_ = 1.0 / options.track_frequency;
   if (options.use_mask)
     camera_masks_ = options.masks;
@@ -119,6 +147,8 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   PRINT_DEBUG("Publishing: %s\n", pub_points_aruco.getTopic().c_str());
   pub_points_sim = nh->advertise<sensor_msgs::PointCloud2>("points_sim", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_sim.getTopic().c_str());
+  if (stereo_points_enabled_)
+    pub_stereo_points_ = nh->advertise<sensor_msgs::PointCloud>("stereo_points", 2);
 
   // Our tracking image
   it_pub_tracks = it.advertise("trackhist", 2);
@@ -279,6 +309,10 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
 ROS1Visualizer::~ROS1Visualizer() {
   stop_workers();
   _app->wait_for_initialization();
+  // Synchronizers disconnect from subscriber signals during destruction.
+  // Keep subscribers alive until every synchronizer has disconnected.
+  sync_cam.clear();
+  sync_subs_cam.clear();
 }
 
 void ROS1Visualizer::stop_workers() {
@@ -986,6 +1020,52 @@ void ROS1Visualizer::process_camera_queue() {
     const PhaseSnapshot vis_start =
         record_timing(camera_feed_timing_, "feed_measurement_camera", feed_start,
                       update_message.timestamp);
+    if (stereo_points_enabled_ && pub_stereo_points_.getNumSubscribers() != 0 &&
+        update_input.images.size() == 2 &&
+        update_input.images[0]->header.stamp == update_input.images[1]->header.stamp) {
+      const auto observations = _app->get_instant_stereo_observations(update_message.timestamp, state_lock);
+      const auto state = _app->get_state();
+      const auto &calib0 = state->_calib_IMUtoCAM.at(0);
+      const auto &calib1 = state->_calib_IMUtoCAM.at(1);
+      const Eigen::Matrix3d R10 = calib1->Rot() * calib0->Rot().transpose();
+      const Eigen::Vector3d t10 = calib1->pos() - R10 * calib0->pos();
+      const auto camera_matrix = [](const std::shared_ptr<CamBase> &camera) {
+        const cv::Matx33d cv_k = camera->get_K();
+        Eigen::Matrix3d k;
+        for (int row = 0; row < 3; ++row)
+          for (int col = 0; col < 3; ++col)
+            k(row, col) = cv_k(row, col);
+        return k;
+      };
+      const Eigen::Matrix3d K0 = camera_matrix(_app->get_params().camera_intrinsics.at(0));
+      const Eigen::Matrix3d K1 = camera_matrix(_app->get_params().camera_intrinsics.at(1));
+      sensor_msgs::PointCloud cloud;
+      cloud.header.stamp = update_input.images[0]->header.stamp;
+      cloud.header.frame_id = update_input.images[0]->header.frame_id;
+      sensor_msgs::ChannelFloat32 ids, reprojection_errors, ray_angles;
+      ids.name = "id";
+      reprojection_errors.name = "reprojection_error_px";
+      ray_angles.name = "ray_angle_deg";
+      cloud.points.reserve(observations.size());
+      ids.values.reserve(observations.size());
+      reprojection_errors.values.reserve(observations.size());
+      ray_angles.values.reserve(observations.size());
+      for (const auto &observation : observations) {
+        InstantStereoPoint point;
+        if (!triangulate_instant_stereo(observation.uv0, observation.uv1, K0, K1, R10, t10, point))
+          continue;
+        geometry_msgs::Point32 xyz;
+        xyz.x = static_cast<float>(point.position_c0.x());
+        xyz.y = static_cast<float>(point.position_c0.y());
+        xyz.z = static_cast<float>(point.position_c0.z());
+        cloud.points.push_back(xyz);
+        ids.values.push_back(static_cast<float>(observation.feature_id));
+        reprojection_errors.values.push_back(static_cast<float>(point.reprojection_error_px));
+        ray_angles.values.push_back(static_cast<float>(point.ray_angle_deg));
+      }
+      cloud.channels = {ids, reprojection_errors, ray_angles};
+      pub_stereo_points_.publish(cloud);
+    }
     visualize();
     record_timing(camera_visualize_timing_, "visualize_camera_update", vis_start, update_message.timestamp);
     const double age = ros::Time::now().toSec() - update_message.timestamp;

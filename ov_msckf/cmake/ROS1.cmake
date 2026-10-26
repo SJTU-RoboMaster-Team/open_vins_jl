@@ -170,6 +170,11 @@ if (catkin_FOUND AND ENABLE_ROS)
         if(TARGET test_bounded_stats_logger)
             target_link_libraries(test_bounded_stats_logger gtest_main)
         endif()
+
+        catkin_add_gtest(test_instant_stereo test/test_instant_stereo.cpp)
+        if(TARGET test_instant_stereo)
+            target_link_libraries(test_instant_stereo ov_msckf_lib ${thirdparty_libraries} gtest_main)
+        endif()
     endif()
 
 endif ()

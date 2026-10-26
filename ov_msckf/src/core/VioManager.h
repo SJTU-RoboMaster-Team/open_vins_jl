@@ -35,6 +35,7 @@
 #include <thread>
 
 #include "VioManagerOptions.h"
+#include "feat/FeatureDatabase.h"
 
 namespace ov_core {
 struct ImuData;
@@ -66,6 +67,8 @@ class Propagator;
 class VioManager {
 
 public:
+  using InstantStereoObservation = ov_core::FeatureDatabase::StereoObservation;
+
   /**
    * @brief Default constructor, will load all configuration variables
    * @param params_ Parameters loaded from either ROS or CMDLINE
@@ -152,6 +155,10 @@ public:
   /// propagation. The asynchronous initializer uses the same lock. In the
   /// synchronous initializer mode its joining caller already owns the lock.
   std::mutex &get_state_mutex() { return estimator_state_mtx; }
+
+  /// Requires the caller's owned estimator lock; returns copied same-frame pixels only.
+  std::vector<InstantStereoObservation> get_instant_stereo_observations(
+      double timestamp, const std::unique_lock<std::mutex> &state_lock);
 
   /// Caller holds get_state_mutex(); debug images wait for a complete frontend.
   bool tracking_in_progress() const { return tracking_in_progress_; }

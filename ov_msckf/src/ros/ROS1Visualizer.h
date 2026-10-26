@@ -192,6 +192,7 @@ protected:
   image_transport::Publisher it_pub_tracks, it_pub_loop_img_depth, it_pub_loop_img_depth_color;
   ros::Publisher pub_poseimu, pub_odomimu, pub_pathimu;
   ros::Publisher pub_recording_diagnostics_;
+  ros::Publisher pub_stereo_points_;
   ros::Publisher pub_points_msckf, pub_points_slam, pub_points_aruco, pub_points_sim;
   ros::Publisher pub_loop_pose, pub_loop_point;
   // One calibration publisher per camera. Camera 0 keeps the historical
@@ -274,6 +275,7 @@ protected:
   double camera_queue_max_age_s_ = 0.15;
   bool camera_tracking_outside_state_lock_ = true;
   bool demand_driven_loop_output_ = true;
+  bool stereo_points_enabled_ = false;
   double camera_dropped_through_ = -1;
   std::atomic<uint64_t> camera_queue_dropped_{0};
   std::atomic<uint64_t> camera_queue_expired_{0};

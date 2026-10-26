@@ -26,6 +26,31 @@
 
 using namespace ov_core;
 
+std::vector<FeatureDatabase::StereoObservation> FeatureDatabase::latest_stereo_observations(double timestamp) {
+  std::vector<StereoObservation> observations;
+  if (!std::isfinite(timestamp))
+    return observations;
+  std::lock_guard<std::mutex> lck(mtx);
+  observations.reserve(features_idlookup.size());
+  for (const auto &entry : features_idlookup) {
+    const auto &feature = *entry.second;
+    const auto times0 = feature.timestamps.find(0), times1 = feature.timestamps.find(1);
+    const auto pixels0 = feature.uvs.find(0), pixels1 = feature.uvs.find(1);
+    if (times0 == feature.timestamps.end() || times1 == feature.timestamps.end() ||
+        pixels0 == feature.uvs.end() || pixels1 == feature.uvs.end() ||
+        times0->second.empty() || times1->second.empty() ||
+        times0->second.back() != timestamp || times1->second.back() != timestamp ||
+        times0->second.size() != pixels0->second.size() || times1->second.size() != pixels1->second.size())
+      continue;
+    StereoObservation observation;
+    observation.feature_id = entry.first;
+    observation.uv0 = pixels0->second.back().cast<double>();
+    observation.uv1 = pixels1->second.back().cast<double>();
+    observations.push_back(observation);
+  }
+  return observations;
+}
+
 std::shared_ptr<Feature> FeatureDatabase::get_feature(size_t id, bool remove) {
   std::lock_guard<std::mutex> lck(mtx);
   if (features_idlookup.find(id) != features_idlookup.end()) {
