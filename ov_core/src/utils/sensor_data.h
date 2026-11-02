@@ -23,6 +23,7 @@
 #define OV_CORE_SENSOR_DATA_H
 
 #include <Eigen/Eigen>
+#include <limits>
 #include <opencv2/opencv.hpp>
 #include <vector>
 
@@ -44,6 +45,29 @@ struct ImuData {
 
   /// Sort function to allow for using of STL containers
   bool operator<(const ImuData &other) const { return timestamp < other.timestamp; }
+};
+
+/**
+ * @brief Struct for a single scalar range measurement.
+ *
+ * The range is measured along the configured sensor axis.  The min/max values
+ * are copied from the driver when available so the updater can apply the
+ * tighter of the driver and configured limits.
+ */
+struct RangeData {
+
+  /// Timestamp of the reading
+  double timestamp = -1.0;
+
+  /// Range along the configured sensor axis (metres)
+  double range = -1.0;
+
+  /// Driver-reported valid range
+  double min_range = 0.0;
+  double max_range = std::numeric_limits<double>::infinity();
+
+  /// Sort function to allow for using of STL containers
+  bool operator<(const RangeData &other) const { return timestamp < other.timestamp; }
 };
 
 /**

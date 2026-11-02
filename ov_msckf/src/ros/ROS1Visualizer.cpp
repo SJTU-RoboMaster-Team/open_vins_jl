@@ -53,6 +53,8 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   async_subs_ = options.use_multi_threading_subs;
   async_pubs_ = options.use_multi_threading_pubs;
   expected_cameras_ = options.state_options.num_cameras;
+  range_aid_enabled_ = options.use_range_aid;
+  range_topic_ = options.range_topic;
   nh->param<bool>("stereo_points_enabled", stereo_points_enabled_, false);
   if (stereo_points_enabled_) {
     if (expected_cameras_ != 2 || !options.use_stereo)
@@ -493,6 +495,24 @@ void ROS1Visualizer::publish_recording_diagnostics(const ros::WallTimerEvent &) 
       add("slam_gated_features_last", updates.slam_gated_last);
       add("slam_gated_features_total", updates.slam_gated_total);
       add("last_slam_stamp_s", updates.last_slam_stamp);
+      add("range_enabled", updates.range_accepted != 0 ||
+                               updates.range_rejected != 0 ||
+                               updates.range_plane_pending != 0 ||
+                               updates.range_plane_initialized ||
+                               range_aid_enabled_);
+      add("range_callback_count", range_callback_count_.load());
+      add("range_bad_message_count", range_bad_message_count_.load());
+      add("range_plane_initialized", updates.range_plane_initialized);
+      add("range_plane_pending", updates.range_plane_pending);
+      add("range_accepted", updates.range_accepted);
+      add("range_rejected", updates.range_rejected);
+      add("last_range_stamp_s", updates.last_range_stamp);
+      add("last_range_m", updates.last_range_m);
+      add("last_range_predicted_m", updates.last_range_predicted_m);
+      add("last_range_innovation_m", updates.last_range_innovation_m);
+      add("last_range_chi2", updates.last_range_chi2);
+      add("last_range_tilt_deg", updates.last_range_tilt_deg);
+      add("range_ground_plane_height_m", updates.range_ground_plane_height_m);
       add("camera_bundles", camera_sync_bundle_count_);
     } else {
       status.level = diagnostic_msgs::DiagnosticStatus::WARN;
@@ -514,6 +534,15 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
   parser->parse_external("relative_config_imu", "imu0", "rostopic", topic_imu);
   sub_imu = _nh->subscribe(topic_imu, 1000, &ROS1Visualizer::callback_inertial, this, ros::TransportHints().tcpNoDelay());
   PRINT_INFO("subscribing to IMU: %s\n", topic_imu.c_str());
+
+  if (range_aid_enabled_) {
+    if (range_topic_.empty())
+      throw std::invalid_argument("range aid requires a non-empty range_topic");
+    sub_range = _nh->subscribe(range_topic_, 100,
+                               &ROS1Visualizer::callback_range, this,
+                               ros::TransportHints().tcpNoDelay());
+    PRINT_INFO("subscribing to downward range aid: %s\n", range_topic_.c_str());
+  }
 
   // Logic for sync stereo subscriber
   // https://answers.ros.org/question/96346/subscribe-to-two-image_raws-with-one-function/?answer=96491#post-id-96491
@@ -894,6 +923,21 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   camera_queue_cv_.notify_one();
   if (!async_subs_)
     process_camera_queue();
+}
+
+void ROS1Visualizer::callback_range(const sensor_msgs::Range::ConstPtr &msg) {
+  if (stopping_.load()) return;
+  range_callback_count_.fetch_add(1, std::memory_order_relaxed);
+  ov_core::RangeData message;
+  message.timestamp = msg->header.stamp.toSec();
+  message.range = msg->range;
+  message.min_range = msg->min_range;
+  message.max_range = msg->max_range;
+  if (!std::isfinite(message.timestamp) || !std::isfinite(message.range)) {
+    range_bad_message_count_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  _app->feed_measurement_range(message);
 }
 
 void ROS1Visualizer::process_camera_queue() {

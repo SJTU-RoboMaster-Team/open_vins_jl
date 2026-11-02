@@ -40,6 +40,7 @@
 #include "state/State.h"
 #include "state/StateHelper.h"
 #include "update/UpdaterMSCKF.h"
+#include "update/UpdaterRange.h"
 #include "update/UpdaterSLAM.h"
 #include "update/UpdaterZeroVelocity.h"
 
@@ -51,6 +52,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <sys/resource.h>
 #include <stdexcept>
 
@@ -270,6 +272,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                                         params.zupt_noise_multiplier, params.zupt_max_disparity,
                                                         params.zupt_require_visual_stationary);
   }
+  if (params.use_range_aid) {
+    updaterRange = std::make_shared<UpdaterRange>(params.range_aid);
+  }
   stats_logger_.reset(new BoundedStatsLogger());
 }
 
@@ -322,6 +327,52 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   // No need to push back if we are just doing the zv-update at the begining and we have moved
   if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
     updaterZUPT->feed_imu(message, oldest_time);
+  }
+}
+
+void VioManager::feed_measurement_range(const ov_core::RangeData &message) {
+  if (updaterRange == nullptr || !std::isfinite(message.timestamp) ||
+      !std::isfinite(message.range)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(range_queue_mtx);
+  const auto where =
+      std::upper_bound(range_queue.begin(), range_queue.end(), message);
+  range_queue.insert(where, message);
+  const double oldest =
+      message.timestamp - std::max(1.0, 10.0 * params.range_aid.max_age_s);
+  while (!range_queue.empty() && range_queue.front().timestamp < oldest) {
+    range_queue.pop_front();
+  }
+  while (range_queue.size() > 100) range_queue.pop_front();
+}
+
+void VioManager::apply_pending_range_update(double timestamp) {
+  if (updaterRange == nullptr || !std::isfinite(timestamp)) {
+    return;
+  }
+  ov_core::RangeData selected;
+  bool have_sample = false;
+  {
+    std::lock_guard<std::mutex> lock(range_queue_mtx);
+    const double oldest = timestamp - 2.0 * params.range_aid.max_age_s;
+    while (!range_queue.empty() && range_queue.front().timestamp < oldest) {
+      range_queue.pop_front();
+    }
+    auto sample = std::upper_bound(
+        range_queue.begin(), range_queue.end(), timestamp,
+        [](double value, const ov_core::RangeData &data) {
+          return value < data.timestamp;
+        });
+    if (sample != range_queue.begin()) {
+      --sample;
+      selected = *sample;
+      have_sample = true;
+      range_queue.erase(range_queue.begin(), std::next(sample));
+    }
+  }
+  if (have_sample) {
+    updaterRange->try_update(state, selected);
   }
 }
 
@@ -484,6 +535,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
       propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       propagator->invalidate_cache();
+      apply_pending_range_update(state->_timestamp);
       return;
     }
   }
@@ -526,6 +578,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (state->_timestamp != message.timestamp) {
     SlowPhaseTimer phase("estimator_propagation_and_clone", message.timestamp);
     propagator->propagate_and_clone(state, message.timestamp);
+  }
+  if (state->_timestamp == message.timestamp) {
+    apply_pending_range_update(state->_timestamp);
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
 

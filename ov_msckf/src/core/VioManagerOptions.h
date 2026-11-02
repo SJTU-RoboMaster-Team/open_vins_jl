@@ -26,10 +26,12 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "state/StateOptions.h"
+#include "update/UpdaterRange.h"
 #include "update/UpdaterOptions.h"
 #include "utils/NoiseManager.h"
 
@@ -97,6 +99,18 @@ struct VioManagerOptions {
   /// If we should only use the zupt at the very beginning static initialization phase
   bool zupt_only_at_beginning = false;
 
+  /// Opt-in downward range aid against a frozen gravity-aligned ground plane
+  bool use_range_aid = false;
+
+  /// ROS topic populated by the flight launcher; never guessed from a sensor name
+  std::string range_topic = "/mavros/distance_sensor/hrlv_ez4_pub";
+
+  /// External OpenVINS range chain containing range0 extrinsics and gates
+  std::string relative_config_range;
+
+  /// Parsed range-aid options; `enabled` mirrors use_range_aid
+  RangeAidOptions range_aid;
+
   /// If we should record the timing performance to file
   bool record_timing_information = false;
 
@@ -121,8 +135,46 @@ struct VioManagerOptions {
       parser->parse_config("zupt_max_disparity", zupt_max_disparity);
       parser->parse_config("zupt_require_visual_stationary", zupt_require_visual_stationary, false);
       parser->parse_config("zupt_only_at_beginning", zupt_only_at_beginning);
+      parser->parse_config("use_range_aid", use_range_aid, false);
+      parser->parse_config("range_topic", range_topic, false);
+      parser->parse_config("relative_config_range", relative_config_range, false);
       parser->parse_config("record_timing_information", record_timing_information);
       parser->parse_config("record_timing_filepath", record_timing_filepath);
+      range_aid.enabled = use_range_aid;
+      if (use_range_aid) {
+        if (relative_config_range.empty())
+          throw std::invalid_argument("use_range_aid requires relative_config_range");
+        std::vector<double> axis = {0.0, 0.0, 1.0};
+        std::vector<double> position = {0.0, 0.0, 0.0};
+        parser->parse_external("relative_config_range", "range0",
+                               "R_range_to_imu",
+                               range_aid.R_range_to_imu);
+        parser->parse_external("relative_config_range", "range0",
+                               "p_range_in_imu",
+                               position);
+        parser->parse_external("relative_config_range", "range0",
+                               "measurement_axis", axis);
+        parser->parse_external("relative_config_range", "range0", "min_range_m",
+                               range_aid.min_range_m);
+        parser->parse_external("relative_config_range", "range0", "max_range_m",
+                               range_aid.max_range_m);
+        parser->parse_external("relative_config_range", "range0", "noise_m",
+                               range_aid.noise_m);
+        parser->parse_external("relative_config_range", "range0", "max_age_s",
+                               range_aid.max_age_s);
+        parser->parse_external("relative_config_range", "range0", "max_tilt_deg",
+                               range_aid.max_tilt_deg);
+        parser->parse_external("relative_config_range", "range0",
+                               "chi2_multiplier",
+                               range_aid.chi2_multiplier);
+        if (axis.size() != 3)
+          throw std::invalid_argument("range0.measurement_axis must have three values");
+        if (position.size() != 3)
+          throw std::invalid_argument("range0.p_range_in_imu must have three values");
+        range_aid.measurement_axis << axis.at(0), axis.at(1), axis.at(2);
+        range_aid.p_range_in_imu << position.at(0), position.at(1),
+            position.at(2);
+      }
     }
     PRINT_DEBUG("  - dt_slam_delay: %.1f\n", dt_slam_delay);
     PRINT_DEBUG("  - zero_velocity_update: %d\n", try_zupt);
@@ -131,6 +183,17 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - zupt_max_disparity: %.4f\n", zupt_max_disparity);
     PRINT_DEBUG("  - zupt_require_visual_stationary?: %d\n", zupt_require_visual_stationary);
     PRINT_DEBUG("  - zupt_only_at_beginning?: %d\n", zupt_only_at_beginning);
+    PRINT_DEBUG("  - use_range_aid: %d\n", use_range_aid);
+    if (use_range_aid) {
+      PRINT_DEBUG("  - range_topic: %s\n", range_topic.c_str());
+      PRINT_DEBUG("  - relative_config_range: %s\n",
+                  relative_config_range.c_str());
+      PRINT_DEBUG("  - range aid: min=%.3f max=%.3f noise=%.3f age=%.3f "
+                  "tilt=%.1f chi2=%.2f\n",
+                  range_aid.min_range_m, range_aid.max_range_m,
+                  range_aid.noise_m, range_aid.max_age_s,
+                  range_aid.max_tilt_deg, range_aid.chi2_multiplier);
+    }
     PRINT_DEBUG("  - record timing?: %d\n", (int)record_timing_information);
     PRINT_DEBUG("  - record timing filepath: %s\n", record_timing_filepath.c_str());
   }

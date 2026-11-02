@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
+#include <deque>
 #include <boost/filesystem.hpp>
 #include <fstream>
 #include <memory>
@@ -39,6 +40,7 @@
 
 namespace ov_core {
 struct ImuData;
+struct RangeData;
 struct CameraData;
 class TrackBase;
 class FeatureInitializer;
@@ -54,6 +56,7 @@ class State;
 class StateHelper;
 class UpdaterMSCKF;
 class UpdaterSLAM;
+class UpdaterRange;
 class UpdaterZeroVelocity;
 class Propagator;
 
@@ -92,6 +95,12 @@ public:
    * @param message Contains our timestamp and inertial information
    */
   void feed_measurement_imu(const ov_core::ImuData &message);
+
+  /**
+   * @brief Feed one scalar downward range sample for the next camera update.
+   * @param message Range, timestamp, and driver limits
+   */
+  void feed_measurement_range(const ov_core::RangeData &message);
 
   /**
    * @brief Feed function for camera measurements
@@ -134,14 +143,33 @@ public:
   /// depend on these counters. Gated counts are the updater's surviving features.
   struct UpdateDiagnostics {
     uint64_t zupt_accepted = 0, msckf_gated_total = 0, slam_gated_total = 0;
+    uint64_t range_accepted = 0, range_rejected = 0, range_plane_pending = 0;
     size_t msckf_gated_last = 0, slam_gated_last = 0;
     double last_zupt_stamp = -1, last_msckf_stamp = -1, last_slam_stamp = -1;
+    double last_range_stamp = -1, last_range_m = -1, last_range_predicted_m = -1;
+    double last_range_innovation_m = 0, last_range_chi2 = 0;
+    double last_range_tilt_deg = 0, range_ground_plane_height_m = 0;
     bool moved_since_zupt = false, last_zupt = false;
+    bool range_plane_initialized = false;
   };
   UpdateDiagnostics update_diagnostics() const {
     auto result = update_diagnostics_;
     result.moved_since_zupt = has_moved_since_zupt;
     result.last_zupt = did_zupt_update;
+    if (updaterRange != nullptr) {
+      const auto range = updaterRange->diagnostics();
+      result.range_accepted = range.accepted;
+      result.range_rejected = range.rejected;
+      result.range_plane_pending = range.plane_pending;
+      result.last_range_stamp = range.last_range_stamp;
+      result.last_range_m = range.last_range_m;
+      result.last_range_predicted_m = range.last_predicted_m;
+      result.last_range_innovation_m = range.last_innovation_m;
+      result.last_range_chi2 = range.last_chi2;
+      result.last_range_tilt_deg = range.last_tilt_deg;
+      result.range_plane_initialized = range.plane_initialized;
+      result.range_ground_plane_height_m = range.ground_plane_height_m;
+    }
     return result;
   }
 
@@ -232,6 +260,9 @@ protected:
    */
   void do_feature_propagate_update(const ov_core::CameraData &message);
 
+  /// Apply the newest non-future range sample at the propagated camera time.
+  void apply_pending_range_update(double timestamp);
+
   /**
    * @brief This function will try to initialize the state.
    *
@@ -287,6 +318,13 @@ protected:
 
   /// Our zero velocity tracker
   std::shared_ptr<UpdaterZeroVelocity> updaterZUPT;
+
+  /// Optional downward range updater
+  std::shared_ptr<UpdaterRange> updaterRange;
+
+  /// Bounded range inbox shared by ROS and estimator threads
+  std::deque<ov_core::RangeData> range_queue;
+  std::mutex range_queue_mtx;
 
   /// This is the queue of measurement times that have come in since we starting doing initialization
   /// After we initialize, we will want to prop & update to the latest timestamp quickly

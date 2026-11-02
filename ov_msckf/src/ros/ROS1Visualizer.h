@@ -38,6 +38,7 @@
 #include <sensor_msgs/NavSatFix.h>
 #include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/Range.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <std_msgs/Float64.h>
 #include <tf/transform_broadcaster.h>
@@ -115,6 +116,9 @@ public:
 
   /// Callback for inertial information
   void callback_inertial(const sensor_msgs::Imu::ConstPtr &msg);
+
+  /// Callback for a downward scalar range sensor
+  void callback_range(const sensor_msgs::Range::ConstPtr &msg);
 
   /// Callback for monocular cameras information
   void callback_monocular(const sensor_msgs::ImageConstPtr &msg0, int cam_id0);
@@ -204,6 +208,7 @@ protected:
 
   // Our subscribers and camera synchronizers
   ros::Subscriber sub_imu;
+  ros::Subscriber sub_range;
   std::vector<ros::Subscriber> subs_cam;
   typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image> sync_pol;
   std::vector<std::shared_ptr<message_filters::Synchronizer<sync_pol>>> sync_cam;
@@ -252,6 +257,10 @@ protected:
   TimingStats image_state_lock_wait_timing_;
   std::atomic<uint64_t> invalid_fast_odom_count_{0};
   uint64_t invalid_fast_odom_last_report_ns_{0};
+  bool range_aid_enabled_ = false;
+  std::string range_topic_;
+  std::atomic<uint64_t> range_callback_count_{0};
+  std::atomic<uint64_t> range_bad_message_count_{0};
 
   // Optional T265 vibration pre-filter. Disabled by default; experiments
   // enable it through private ROS parameters without changing the estimator

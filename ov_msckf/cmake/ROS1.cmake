@@ -85,6 +85,7 @@ list(APPEND LIBRARY_SOURCES
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
         src/update/UpdaterMSCKF.cpp
+        src/update/UpdaterRange.cpp
         src/update/UpdaterSLAM.cpp
         src/update/UpdaterZeroVelocity.cpp
 )
@@ -174,6 +175,11 @@ if (catkin_FOUND AND ENABLE_ROS)
         catkin_add_gtest(test_instant_stereo test/test_instant_stereo.cpp)
         if(TARGET test_instant_stereo)
             target_link_libraries(test_instant_stereo ov_msckf_lib ${thirdparty_libraries} gtest_main)
+        endif()
+
+        catkin_add_gtest(test_updater_range test/test_updater_range.cpp)
+        if(TARGET test_updater_range)
+            target_link_libraries(test_updater_range ov_msckf_lib ${thirdparty_libraries} gtest_main)
         endif()
     endif()
 
