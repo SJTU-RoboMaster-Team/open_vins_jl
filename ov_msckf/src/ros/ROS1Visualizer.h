@@ -32,6 +32,8 @@
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <ros/ros.h>
+#include <ros/callback_queue.h>
+#include <ros/spinner.h>
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/Imu.h>
@@ -213,6 +215,14 @@ protected:
   typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image> sync_pol;
   std::vector<std::shared_ptr<message_filters::Synchronizer<sync_pol>>> sync_cam;
   std::vector<std::shared_ptr<message_filters::Subscriber<sensor_msgs::Image>>> sync_subs_cam;
+
+  // Optional simulation-only ingress isolation. Keep the queue alive longer
+  // than its NodeHandle and spinner; all three are stopped before workers join.
+  std::unique_ptr<ros::CallbackQueue> imu_callback_queue_;
+  std::unique_ptr<ros::NodeHandle> imu_node_handle_;
+  std::unique_ptr<ros::AsyncSpinner> imu_spinner_;
+  bool imu_dedicated_callback_queue_ = false;
+  bool subscribers_setup_ = false;
 
   // For path viz
   unsigned int poses_seq_imu = 0;

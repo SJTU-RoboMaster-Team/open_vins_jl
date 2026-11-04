@@ -4,10 +4,13 @@
 #include <memory>
 #include <vector>
 
+#include "cam/CamRadtan.h"
+#include "core/VioManager.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/Feature.h"
 #include "state/Propagator.h"
 #include "state/State.h"
+#include "track/TrackBase.h"
 #include "update/UpdaterOptions.h"
 #include "update/UpdaterZeroVelocity.h"
 #include "utils/NoiseManager.h"
@@ -23,6 +26,55 @@ using ov_msckf::State;
 using ov_msckf::StateOptions;
 using ov_msckf::UpdaterOptions;
 using ov_msckf::UpdaterZeroVelocity;
+
+ov_msckf::VioManagerOptions manager_options() {
+  ov_msckf::VioManagerOptions options;
+  options.state_options.num_cameras = 1;
+  options.state_options.max_clone_size = 5;
+  options.state_options.max_slam_features = 0;
+  options.use_aruco = false;
+  options.use_klt = true;
+  options.use_stereo = false;
+  options.histogram_method = ov_core::TrackBase::NONE;
+  options.num_opencv_threads = 1;
+
+  auto camera = std::make_shared<ov_core::CamRadtan>(64, 48);
+  Eigen::Matrix<double, 8, 1> intrinsics;
+  intrinsics << 40.0, 40.0, 32.0, 24.0, 0.0, 0.0, 0.0, 0.0;
+  camera->set_value(intrinsics);
+  options.camera_intrinsics.emplace(0, camera);
+  Eigen::Matrix<double, 7, 1> extrinsics;
+  extrinsics << 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0;
+  options.camera_extrinsics.emplace(0, extrinsics);
+  options.init_options.num_cameras = 1;
+  options.init_options.camera_intrinsics = options.camera_intrinsics;
+  options.init_options.camera_extrinsics = options.camera_extrinsics;
+  options.init_options.init_window_time = 2.0;
+  options.vec_dw << 1.0, 0.0, 0.0, 1.0, 0.0, 1.0;
+  options.vec_da << 1.0, 0.0, 0.0, 1.0, 0.0, 1.0;
+  options.vec_tg.setZero();
+  options.q_GYROtoIMU << 0.0, 0.0, 0.0, 1.0;
+  options.q_ACCtoIMU << 0.0, 0.0, 0.0, 1.0;
+  options.try_zupt = true;
+  options.zupt_require_visual_stationary = true;
+  options.zupt_max_disparity = 0.5;
+  return options;
+}
+
+class TestVioManager final : public ov_msckf::VioManager {
+public:
+  explicit TestVioManager(ov_msckf::VioManagerOptions &options)
+      : VioManager(options) {}
+
+  using VioManager::state;
+  using VioManager::trackFEATS;
+  using VioManager::updaterZUPT;
+
+  void finish_static_initialization(double timestamp) {
+    state->_timestamp = timestamp;
+    is_initialized_vio = true;
+  }
+};
 
 struct ZuptFixture {
   StateOptions state_options;
@@ -101,6 +153,37 @@ TEST(UpdaterZeroVelocityIntegration, OptInRejectsVisualStillnessWithImuResidual)
 
   EXPECT_FALSE(fixture.updater->try_update(fixture.state, 1.1));
   EXPECT_DOUBLE_EQ(fixture.state->_timestamp, 1.0);
+}
+
+TEST(VioManagerZuptIntegration, FirstUpdateHasPreInitializationImuHistory) {
+  auto options = manager_options();
+  TestVioManager manager(options);
+
+  // Startup IMU samples arrive before the inertial initializer accepts its
+  // static window. The first ZUPT then consumes that same window.
+  for (int index = 0; index <= 20; ++index) {
+    ImuData sample;
+    sample.timestamp = 0.90 + 0.01 * index;
+    sample.wm.setZero();
+    sample.am << 0.0, 0.0, 9.81;
+    manager.feed_measurement_imu(sample);
+  }
+
+  for (std::size_t feature = 0; feature < 25; ++feature) {
+    const float u = static_cast<float>(feature * 4);
+    const float v = static_cast<float>(feature * 2);
+    manager.trackFEATS->get_feature_database()->update_feature(
+        feature, 1.0, 0, u, v, u, v);
+    manager.trackFEATS->get_feature_database()->update_feature(
+        feature, 1.1, 0, u + 0.1F, v, u + 0.1F, v);
+    manager.trackFEATS->get_feature_database()->get_feature(feature)->to_delete = false;
+  }
+
+  manager.finish_static_initialization(1.0);
+
+  ASSERT_NE(manager.updaterZUPT, nullptr);
+  EXPECT_TRUE(manager.updaterZUPT->try_update(manager.state, 1.1));
+  EXPECT_DOUBLE_EQ(manager.state->_timestamp, 1.1);
 }
 
 }  // namespace

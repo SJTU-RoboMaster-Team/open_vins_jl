@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
+#include <stdexcept>
 #include <sstream>
 #include <sys/resource.h>
 
@@ -50,7 +51,11 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
     : _nh(nh), _app(app), _sim(sim) {
 
   const auto &options = _app->get_params();
-  async_subs_ = options.use_multi_threading_subs;
+  nh->param<bool>("imu_dedicated_callback_queue", imu_dedicated_callback_queue_, false);
+  // Keep camera feature processing on its worker when IMU callbacks have
+  // their own queue. This is local to the visualizer: VioManager's threading
+  // option still controls its existing initialization/locking behavior.
+  async_subs_ = options.use_multi_threading_subs || imu_dedicated_callback_queue_;
   async_pubs_ = options.use_multi_threading_pubs;
   expected_cameras_ = options.state_options.num_cameras;
   range_aid_enabled_ = options.use_range_aid;
@@ -326,6 +331,17 @@ void ROS1Visualizer::stop_workers() {
     stopping_.store(true);
   }
   camera_queue_cv_.notify_all();
+  // Stop and join the IMU callback worker before joining the camera worker so
+  // no new IMU callback can enqueue camera work during shutdown.
+  if (imu_dedicated_callback_queue_) {
+    sub_imu.shutdown();
+    if (imu_spinner_)
+      imu_spinner_->stop();
+    if (imu_callback_queue_) {
+      imu_callback_queue_->disable();
+      imu_callback_queue_->clear();
+    }
+  }
   timing_diagnostics_timer_.stop();
   recording_diagnostics_timer_.stop();
   if (update_thread_.joinable())
@@ -527,12 +543,26 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
 
   // We need a valid parser
   assert(parser != nullptr);
+  if (subscribers_setup_)
+    throw std::logic_error("ROS1Visualizer::setup_subscribers may only be called once");
+  subscribers_setup_ = true;
 
   // Create imu subscriber (handle legacy ros param info)
   std::string topic_imu;
   _nh->param<std::string>("topic_imu", topic_imu, "/imu0");
   parser->parse_external("relative_config_imu", "imu0", "rostopic", topic_imu);
-  sub_imu = _nh->subscribe(topic_imu, 1000, &ROS1Visualizer::callback_inertial, this, ros::TransportHints().tcpNoDelay());
+  if (imu_dedicated_callback_queue_) {
+    imu_callback_queue_ = std::make_unique<ros::CallbackQueue>();
+    imu_node_handle_ = std::make_unique<ros::NodeHandle>(*_nh);
+    imu_node_handle_->setCallbackQueue(imu_callback_queue_.get());
+    sub_imu = imu_node_handle_->subscribe(
+        topic_imu, 1000, &ROS1Visualizer::callback_inertial, this,
+        ros::TransportHints().tcpNoDelay());
+    PRINT_INFO("dedicated IMU callback queue enabled: %s\n", topic_imu.c_str());
+  } else {
+    sub_imu = _nh->subscribe(topic_imu, 1000, &ROS1Visualizer::callback_inertial,
+                             this, ros::TransportHints().tcpNoDelay());
+  }
   PRINT_INFO("subscribing to IMU: %s\n", topic_imu.c_str());
 
   if (range_aid_enabled_) {
@@ -580,6 +610,11 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
           ros::VoidConstPtr(), ros::TransportHints().tcpNoDelay()));
       PRINT_INFO("subscribing to cam (mono): %s\n", cam_topic.c_str());
     }
+  }
+  if (imu_dedicated_callback_queue_) {
+    // Start only after all subscribers are wired to their intended queues.
+    imu_spinner_ = std::make_unique<ros::AsyncSpinner>(1, imu_callback_queue_.get());
+    imu_spinner_->start();
   }
 }
 
